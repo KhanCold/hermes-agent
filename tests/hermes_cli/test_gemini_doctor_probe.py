@@ -9,7 +9,11 @@ class TestGeminiDoctorProbeHeaders(unittest.TestCase):
     """Verify _probe_apikey_provider sends x-goog-api-key for Gemini endpoints."""
 
     def _get_doctor_source(self):
-        with open("/tmp/hermes-agent-fork/hermes_cli/doctor.py") as f:
+        # Resolve path relative to test file location (tests/hermes_cli/ → repo root)
+        import pathlib
+        repo_root = pathlib.Path(__file__).resolve().parents[2]
+        doctor_path = repo_root / "hermes_cli" / "doctor.py"
+        with open(doctor_path) as f:
             return f.read()
 
     def test_gemini_header_branch_exists(self):

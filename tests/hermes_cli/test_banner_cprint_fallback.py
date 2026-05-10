@@ -9,7 +9,10 @@ class TestPromptToolkitFallback(unittest.TestCase):
 
     def test_cprint_has_try_except(self):
         """cprint function body must contain try/except wrapping _pt_print."""
-        with open("/tmp/hermes-agent-fork/hermes_cli/banner.py") as f:
+        import pathlib
+        repo_root = pathlib.Path(__file__).resolve().parents[2]
+        banner_path = repo_root / "hermes_cli" / "banner.py"
+        with open(banner_path) as f:
             source = f.read()
         # Find cprint function
         idx = source.find("def cprint(")

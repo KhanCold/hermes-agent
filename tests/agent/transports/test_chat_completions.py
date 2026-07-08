@@ -995,6 +995,31 @@ class TestChatCompletionsCacheStats:
         result = transport.extract_cache_stats(r)
         assert result == {"cached_tokens": 500, "creation_tokens": 100}
 
+    def test_normalize_response_preserves_usage_cache_and_reasoning_details(self, transport):
+        details = SimpleNamespace(cached_tokens=500, cache_write_tokens=100)
+        completion_details = SimpleNamespace(reasoning_tokens=25)
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="ok", tool_calls=None, reasoning_content=None),
+                finish_reason="stop",
+            )],
+            usage=SimpleNamespace(
+                prompt_tokens=1000,
+                completion_tokens=200,
+                total_tokens=1200,
+                prompt_tokens_details=details,
+                completion_tokens_details=completion_details,
+            ),
+        )
+
+        nr = transport.normalize_response(r)
+
+        assert nr.usage.prompt_tokens == 1000
+        assert nr.usage.completion_tokens == 200
+        assert nr.usage.prompt_tokens_details.cached_tokens == 500
+        assert nr.usage.prompt_tokens_details.cache_write_tokens == 100
+        assert nr.usage.output_tokens_details.reasoning_tokens == 25
+
 
 class TestChatCompletionsGeminiNativeExtraBodyStrip:
     """Profile extra_body (e.g. Nous portal tags) must not reach a native

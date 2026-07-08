@@ -10,6 +10,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import copy
+from types import SimpleNamespace
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -17,6 +18,30 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+
+_MISSING = object()
+
+
+def _usage_field(obj: Any, name: str, default: Any = 0) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    value = getattr(obj, name, _MISSING)
+    if value is not _MISSING:
+        return value
+    model_extra = getattr(obj, "model_extra", None)
+    if isinstance(model_extra, dict) and name in model_extra:
+        return model_extra[name]
+    return default
+
+
+def _usage_int(obj: Any, name: str) -> int:
+    try:
+        return int(_usage_field(obj, name, 0) or 0)
+    except Exception:
+        return 0
 
 
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
@@ -639,10 +664,36 @@ class ChatCompletionsTransport(ProviderTransport):
         usage = None
         if hasattr(response, "usage") and response.usage:
             u = response.usage
+            prompt_details = _usage_field(u, "prompt_tokens_details", None)
+            completion_details = _usage_field(u, "completion_tokens_details", None)
+            output_details = _usage_field(u, "output_tokens_details", None)
+            cache_read_tokens = _usage_int(prompt_details, "cached_tokens")
+            if not cache_read_tokens:
+                cache_read_tokens = _usage_int(u, "cacheReadInputTokensCompatible")
+            if not cache_read_tokens:
+                cache_read_tokens = _usage_int(u, "cache_read_input_tokens")
+            cache_write_tokens = _usage_int(prompt_details, "cache_write_tokens")
+            if not cache_write_tokens:
+                cache_write_tokens = _usage_int(prompt_details, "cache_creation_tokens")
+            if not cache_write_tokens:
+                cache_write_tokens = _usage_int(u, "cache_creation_input_tokens")
+            reasoning_tokens = _usage_int(output_details, "reasoning_tokens")
+            if not reasoning_tokens:
+                reasoning_tokens = _usage_int(completion_details, "reasoning_tokens")
             usage = Usage(
-                prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
-                completion_tokens=getattr(u, "completion_tokens", 0) or 0,
-                total_tokens=getattr(u, "total_tokens", 0) or 0,
+                prompt_tokens=_usage_int(u, "prompt_tokens"),
+                completion_tokens=_usage_int(u, "completion_tokens"),
+                total_tokens=_usage_int(u, "total_tokens"),
+                cached_tokens=cache_read_tokens,
+                prompt_tokens_details=SimpleNamespace(
+                    cached_tokens=cache_read_tokens,
+                    cache_write_tokens=cache_write_tokens,
+                ),
+                output_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens),
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens),
+                cache_read_input_tokens=cache_read_tokens,
+                cache_creation_input_tokens=cache_write_tokens,
+                cacheReadInputTokensCompatible=cache_read_tokens,
             )
 
         # Preserve reasoning fields separately.  DeepSeek/Moonshot use

@@ -32,7 +32,7 @@ class RealShopStaleStep(BaseException):
 
 
 class RealShopToolTurnComplete(BaseException):
-    """Stop Hermes' inner loop after one RealShop /act turn."""
+    """Stop Hermes' inner loop after RealShop marks the hook complete."""
 
     def __init__(self, messages: list[dict[str, Any]]) -> None:
         super().__init__("realshop tool turn complete")
@@ -387,6 +387,7 @@ class RealShopHermesAgent(AIAgent):
         api_key: Optional[str],
         provider: Optional[str],
         quiet: bool,
+        max_iterations: int,
     ) -> None:
         run_id = str(getattr(realshop_client, "run_id", "") or "")
         super().__init__(
@@ -394,7 +395,7 @@ class RealShopHermesAgent(AIAgent):
             api_key=api_key,
             provider=provider,
             model=model,
-            max_iterations=1,
+            max_iterations=max_iterations,
             quiet_mode=quiet,
             save_trajectories=False,
             session_id=_realshop_session_id(run_id),
@@ -565,7 +566,8 @@ class RealShopHermesAgent(AIAgent):
         self._realshop_last_act = act_resp
         self._realshop_step_done = bool(act_resp.get("step_done"))
         _append_tool_results(messages, act_resp, name_by_tool_call_id=name_by_id)
-        raise RealShopToolTurnComplete(messages)
+        if self._realshop_step_done:
+            raise RealShopToolTurnComplete(messages)
 
 
 def _tick_step(obs: dict[str, Any]) -> int:
@@ -606,6 +608,7 @@ def _build_agent(args: argparse.Namespace, client: RealShopToolClient) -> RealSh
         api_key=args.openai_api_key or os.environ.get("OPENAI_API_KEY"),
         provider=args.provider or os.environ.get("HERMES_PROVIDER"),
         quiet=args.quiet,
+        max_iterations=max(1, int(args.max_hops_per_step)),
     )
 
 
@@ -660,72 +663,50 @@ def run(args: argparse.Namespace) -> int:
         history_len_before_step = len(history)
         agent._realshop_step_done = False
         agent._realshop_last_act = None
-        trace_for_next_act: list[dict[str, Any]] = []
 
         stale_step = False
         no_tool_token_usage = None
-        for hop in range(args.max_hops_per_step):
-            agent.refresh_realshop_tools()
-            agent.queue_realshop_trace_messages(trace_for_next_act)
-            agent._realshop_last_act = None
-            history_before_hop = list(history)
-            usage_before_hop = _usage_snapshot(agent)
-            prompt = (
-                observation_msg["content"]
-                if hop == 0
-                else "Continue this RealShop hook using the tool results above. "
-                     "Call end_of_step when you are done acting for this hook."
+        agent.refresh_realshop_tools()
+        agent.queue_realshop_trace_messages([])
+        history_before_step = list(history)
+        usage_before_step = _usage_snapshot(agent)
+        try:
+            result = agent.run_conversation(
+                observation_msg["content"],
+                system_message=system_prompt,
+                conversation_history=history,
             )
-            try:
-                result = agent.run_conversation(
-                    prompt,
-                    system_message=system_prompt,
-                    conversation_history=history,
-                )
-            except RealShopToolTurnComplete as done:
-                history = list(done.messages)
-            except RealShopStaleStep:
-                history = history[:history_len_before_step]
-                stale_step = True
-                break
-            else:
-                history = list(result.get("messages") or history)
-                if agent._realshop_last_act is None:
-                    exclude_messages = [observation_msg] if hop == 0 else []
-                    agent._realshop_trace_msgs_for_act = [
-                        *agent._realshop_trace_msgs_for_act,
-                        *_new_trace_messages(
-                            history_before_hop,
-                            history,
-                            exclude_messages=exclude_messages,
-                        ),
-                    ]
-                    no_tool_token_usage = _usage_delta(usage_before_hop, agent)
-            trace_for_next_act = []
-            if agent._realshop_step_done:
-                break
-            if agent._realshop_last_act is None:
-                history = _force_end_of_step(
-                    client,
-                    history,
-                    agent._realshop_trace_msgs_for_act,
-                    "[fallback] Hermes returned no tool call; releasing the hook.",
-                    token_usage=no_tool_token_usage,
-                )
-                agent._realshop_trace_msgs_for_act = []
-                break
+        except RealShopToolTurnComplete as done:
+            history = list(done.messages)
+        except RealShopStaleStep:
+            history = history[:history_len_before_step]
+            stale_step = True
         else:
+            history = list(result.get("messages") or history)
+
+        if stale_step:
+            continue
+
+        if not agent._realshop_step_done:
+            if agent._realshop_last_act is None:
+                agent._realshop_trace_msgs_for_act = [
+                    *agent._realshop_trace_msgs_for_act,
+                    *_new_trace_messages(
+                        history_before_step,
+                        history,
+                        exclude_messages=[observation_msg],
+                    ),
+                ]
+                no_tool_token_usage = _usage_delta(usage_before_step, agent)
             history = _force_end_of_step(
                 client,
                 history,
                 agent._realshop_trace_msgs_for_act,
-                "[fallback] max Hermes hops reached; releasing the hook.",
+                "[fallback] Hermes did not call end_of_step; releasing the hook.",
                 token_usage=no_tool_token_usage,
             )
             agent._realshop_trace_msgs_for_act = []
 
-        if stale_step:
-            continue
         step_count += 1
         if args.max_observations is not None and step_count >= int(args.max_observations):
             return 0

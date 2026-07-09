@@ -567,6 +567,10 @@ class RealShopHermesAgent(AIAgent):
         self._realshop_step_done = bool(act_resp.get("step_done"))
         _append_tool_results(messages, act_resp, name_by_tool_call_id=name_by_id)
         if self._realshop_step_done:
+            try:
+                self._flush_messages_to_session_db(messages)
+            except Exception as exc:
+                log.warning("Hermes SessionDB flush failed after RealShop end_of_step: %s", exc)
             raise RealShopToolTurnComplete(messages)
 
 
@@ -667,7 +671,7 @@ def run(args: argparse.Namespace) -> int:
         stale_step = False
         no_tool_token_usage = None
         agent.refresh_realshop_tools()
-        agent.queue_realshop_trace_messages([])
+        agent.queue_realshop_trace_messages([observation_msg])
         history_before_step = list(history)
         usage_before_step = _usage_snapshot(agent)
         try:

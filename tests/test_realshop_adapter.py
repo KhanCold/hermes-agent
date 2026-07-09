@@ -81,6 +81,7 @@ def test_idealab_runs_add_session_header_to_llm_requests():
         api_key="test-key",
         provider=None,
         quiet=True,
+        max_iterations=30,
     )
 
     assert agent.init_kwargs["request_overrides"]["extra_headers"] == {
@@ -103,6 +104,7 @@ def test_realshop_runs_enable_hermes_session_db_recording():
             api_key="test-key",
             provider=None,
             quiet=True,
+            max_iterations=30,
         )
 
     assert agent.init_kwargs["session_id"] == "realshop-run-1"
@@ -304,6 +306,65 @@ def test_mixed_native_and_realshop_tool_call_reports_token_usage_once():
         "function": {"name": "search_products", "arguments": '{"query":"toy"}'},
         "hermes_tool_name": "realshop__search_products",
     }]
+
+
+def test_realshop_end_of_step_flushes_tool_results_to_session_db():
+    class StepDoneClient(FakeRealShopClient):
+        def act(self, assistant_message=None, token_usage=None, *, messages=None):
+            self.act_calls.append({
+                "assistant_message": assistant_message,
+                "token_usage": token_usage,
+                "messages": list(messages or [assistant_message]),
+            })
+            return {
+                "ok": True,
+                "tool_results": [{
+                    "tool_call_id": "call_eos_0",
+                    "name": "end_of_step",
+                    "tool_origin": "realshop_env",
+                    "content": '{"ok": true}',
+                }],
+                "step_done": True,
+            }
+
+    client = StepDoneClient()
+    agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
+    agent.realshop_client = client
+    agent.provider = "openai"
+    agent.api_mode = "chat_completions"
+    agent._realshop_step_done = False
+    agent._realshop_last_act = None
+    agent._realshop_trace_msgs_for_act = []
+    agent._native_tools = []
+    agent.tools = []
+    agent.valid_tool_names = set()
+    flushed = []
+
+    def fake_flush(target_messages, conversation_history=None):
+        flushed.append([dict(msg) for msg in target_messages])
+
+    agent._flush_messages_to_session_db = fake_flush
+    assistant_message = SimpleNamespace(
+        content="Release the hook.",
+        usage=None,
+        tool_calls=[
+            SimpleNamespace(
+                id="call_eos_0",
+                function=SimpleNamespace(name="end_of_step", arguments="{}"),
+            ),
+        ],
+    )
+    messages = [{"role": "assistant", "content": "Release the hook."}]
+
+    try:
+        agent._execute_tool_calls(assistant_message, messages, "task-1", 1)
+    except RealShopToolTurnComplete:
+        pass
+
+    assert flushed
+    assert [m["role"] for m in flushed[0][-2:]] == ["assistant", "tool"]
+    assert flushed[0][-1]["tool_call_id"] == "call_eos_0"
+    assert flushed[0][-1]["content"] == '{"ok": true}'
 
 
 def test_no_tool_assistant_trace_can_be_flushed_with_fallback_end_of_step():

@@ -33,6 +33,7 @@ from realshop_adapter.runner import (
     RealShopHermesAgent,
     RealShopToolTurnComplete,
     build_arg_parser,
+    run,
     _force_end_of_step,
     _new_trace_messages,
     _token_usage,
@@ -55,11 +56,12 @@ class FakeRealShopClient:
             },
         }]
 
-    def act(self, assistant_message=None, token_usage=None, *, messages=None):
+    def act(self, assistant_message=None, token_usage=None, *, messages=None, context=None):
         self.act_calls.append({
             "assistant_message": assistant_message,
             "token_usage": token_usage,
             "messages": list(messages or [assistant_message]),
+            "context": context,
         })
         return {"ok": True, "tool_results": [], "step_done": False}
 
@@ -286,6 +288,7 @@ def test_mixed_native_and_realshop_tool_call_reports_token_usage_once():
     assert len(client.act_calls) == 2
     native_trace_call, env_tool_call = client.act_calls
     assert native_trace_call["token_usage"] is None
+    assert native_trace_call["context"] == {"tokens": 100}
     assert env_tool_call["token_usage"] == {
         "input": 100,
         "output": 20,
@@ -294,6 +297,7 @@ def test_mixed_native_and_realshop_tool_call_reports_token_usage_once():
         "reasoning": 0,
         "total": 120,
     }
+    assert env_tool_call["context"] == {"tokens": 100}
     assert [m["tool_origin"] for m in native_trace_call["messages"]] == [
         "hermes_native",
         "hermes_native",
@@ -308,13 +312,50 @@ def test_mixed_native_and_realshop_tool_call_reports_token_usage_once():
     }]
 
 
+def test_realshop_tool_call_preserves_assistant_message_identity():
+    client = FakeRealShopClient()
+    agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
+    agent.realshop_client = client
+    agent.provider = "openai"
+    agent.api_mode = "chat_completions"
+    agent._realshop_step_done = False
+    agent._realshop_last_act = None
+    agent._realshop_trace_msgs_for_act = []
+    agent._native_tools = []
+    agent.tools = []
+    agent.valid_tool_names = set()
+
+    assistant_message = SimpleNamespace(
+        content="Search products.",
+        usage=None,
+        tool_calls=[
+            SimpleNamespace(
+                id="call_env_0",
+                function=SimpleNamespace(
+                    name="realshop__search_products",
+                    arguments='{"query":"toy"}',
+                ),
+            )
+        ],
+    )
+    persisted_assistant = {"role": "assistant", "content": "Search products."}
+    messages = [persisted_assistant]
+
+    agent._execute_tool_calls(assistant_message, messages, "task-1", 1)
+
+    assert messages[-1] is persisted_assistant
+    assert messages[-1]["tool_origin"] == "realshop_env"
+    assert messages[-1]["tool_calls"][0]["tool_origin"] == "realshop_env"
+
+
 def test_realshop_end_of_step_flushes_tool_results_to_session_db():
     class StepDoneClient(FakeRealShopClient):
-        def act(self, assistant_message=None, token_usage=None, *, messages=None):
+        def act(self, assistant_message=None, token_usage=None, *, messages=None, context=None):
             self.act_calls.append({
                 "assistant_message": assistant_message,
                 "token_usage": token_usage,
                 "messages": list(messages or [assistant_message]),
+                "context": context,
             })
             return {
                 "ok": True,
@@ -367,6 +408,84 @@ def test_realshop_end_of_step_flushes_tool_results_to_session_db():
     assert flushed[0][-1]["content"] == '{"ok": true}'
 
 
+def test_realshop_context_marks_compression_once_after_successful_act():
+    client = FakeRealShopClient()
+    agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
+    agent.realshop_client = client
+    agent.provider = "openai"
+    agent.api_mode = "chat_completions"
+    agent._realshop_step_done = False
+    agent._realshop_last_act = None
+    agent._realshop_trace_msgs_for_act = []
+    agent._native_tools = []
+    agent.tools = []
+    agent.valid_tool_names = set()
+    agent.context_compressor = SimpleNamespace(
+        last_prompt_tokens=77,
+        compression_count=1,
+    )
+    agent._realshop_reported_compression_count = 0
+
+    def fake_super_execute(
+        _self,
+        _assistant_message,
+        target_messages,
+        _task_id,
+        _api_call_count=0,
+    ):
+        target_messages.append({
+            "role": "tool",
+            "tool_call_id": "call_native_0",
+            "name": "terminal",
+            "content": "/tmp/workspace",
+        })
+
+    assistant_message = SimpleNamespace(
+        content="Inspect files.",
+        usage=None,
+        tool_calls=[
+            SimpleNamespace(
+                id="call_native_0",
+                function=SimpleNamespace(name="terminal", arguments='{"command":"pwd"}'),
+            )
+        ],
+    )
+
+    with patch.object(
+        RealShopHermesAgent.__mro__[1],
+        "_execute_tool_calls",
+        fake_super_execute,
+    ):
+        agent._execute_tool_calls(
+            assistant_message,
+            [{"role": "assistant", "content": "Inspect files."}],
+            "task-1",
+            1,
+        )
+
+    assert client.act_calls[0]["context"] == {
+        "tokens": 77,
+        "compacted": True,
+    }
+    assert agent._realshop_reported_compression_count == 1
+
+    agent.context_compressor.last_prompt_tokens = 88
+    agent._realshop_trace_msgs_for_act = []
+    with patch.object(
+        RealShopHermesAgent.__mro__[1],
+        "_execute_tool_calls",
+        fake_super_execute,
+    ):
+        agent._execute_tool_calls(
+            assistant_message,
+            [{"role": "assistant", "content": "Inspect files again."}],
+            "task-1",
+            2,
+        )
+
+    assert client.act_calls[1]["context"] == {"tokens": 88}
+
+
 def test_no_tool_assistant_trace_can_be_flushed_with_fallback_end_of_step():
     client = FakeRealShopClient()
     prior_history = [{"role": "assistant", "content": "previous"}]
@@ -389,6 +508,7 @@ def test_no_tool_assistant_trace_can_be_flushed_with_fallback_end_of_step():
         trace_messages,
         "[fallback] Hermes returned no tool call; releasing the hook.",
         token_usage={"input": 11, "output": 7, "cache_read": 3, "total": 21},
+        context={"tokens": 55, "compacted": True},
     )
 
     stored = client.act_calls[0]["messages"]
@@ -402,6 +522,10 @@ def test_no_tool_assistant_trace_can_be_flushed_with_fallback_end_of_step():
         "output": 7,
         "cache_read": 3,
         "total": 21,
+    }
+    assert client.act_calls[0]["context"] == {
+        "tokens": 55,
+        "compacted": True,
     }
 
 
@@ -420,6 +544,83 @@ def test_new_trace_messages_can_exclude_observation_already_recorded_by_env():
     assert [m["role"] for m in trace] == ["assistant"]
     assert trace[0]["content"] == "I need more data."
     assert trace[0]["tool_origin"] == "hermes_native"
+
+
+def test_run_does_not_send_observation_back_to_realshop_act(monkeypatch):
+    class FakeLoopClient(FakeRealShopClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.register_calls = []
+
+        def register(self, **kwargs):
+            self.register_calls.append(kwargs)
+
+        def observation(self):
+            return {
+                "text": "Day 1, Hour 0\nObservation text",
+                "tick": {"step": 0},
+                "brief": {"system_prompt": "system prompt"},
+            }
+
+    class FakeLoopAgent:
+        def __init__(self):
+            self._realshop_step_done = False
+            self._realshop_last_act = None
+            self._realshop_trace_msgs_for_act = []
+            self._realshop_reported_compression_count = 0
+            self.context_compressor = SimpleNamespace(
+                compression_count=0,
+                last_prompt_tokens=0,
+            )
+
+        def refresh_realshop_tools(self):
+            return None
+
+        def queue_realshop_trace_messages(self, messages):
+            self._realshop_trace_msgs_for_act = list(messages)
+
+        def run_conversation(
+            self,
+            user_message,
+            *,
+            system_message=None,
+            conversation_history=None,
+        ):
+            return {
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "assistant", "content": "Need one more check."},
+                ],
+            }
+
+    created = {}
+
+    def fake_client_factory(*args, **kwargs):
+        created["client"] = FakeLoopClient()
+        return created["client"]
+
+    def fake_build_agent(args, client):
+        created["agent"] = FakeLoopAgent()
+        return created["agent"]
+
+    monkeypatch.setattr(
+        "realshop_adapter.runner.RealShopToolClient",
+        fake_client_factory,
+    )
+    monkeypatch.setattr("realshop_adapter.runner._build_agent", fake_build_agent)
+
+    args = build_arg_parser().parse_args([
+        "--run-id", "run-1",
+        "--base-url", "http://127.0.0.1:5050",
+        "--max-observations", "1",
+        "--quiet",
+    ])
+
+    assert run(args) == 0
+
+    sent_messages = created["client"].act_calls[0]["messages"]
+    assert [m["role"] for m in sent_messages] == ["assistant", "assistant"]
+    assert all("Observation text" not in str(m.get("content", "")) for m in sent_messages)
 
 
 def test_usage_delta_returns_canonical_session_token_buckets():

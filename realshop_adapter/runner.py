@@ -268,6 +268,68 @@ def _token_usage(
     }
 
 
+def _raw_prompt_tokens(assistant_message: Any) -> int:
+    usage = getattr(assistant_message, "usage", None)
+    if usage is None and isinstance(assistant_message, dict):
+        usage = assistant_message.get("usage")
+    if usage is None:
+        return 0
+    try:
+        if isinstance(usage, dict):
+            return int(usage.get("prompt_tokens") or 0)
+        return int(getattr(usage, "prompt_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _compressor_count(agent: Any) -> int:
+    compressor = getattr(agent, "context_compressor", None)
+    try:
+        return int(getattr(compressor, "compression_count", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _compressor_prompt_tokens(agent: Any) -> int:
+    compressor = getattr(agent, "context_compressor", None)
+    try:
+        return int(getattr(compressor, "last_prompt_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _realshop_context(
+    agent: Any,
+    assistant_message: Optional[Any] = None,
+) -> Optional[dict[str, Any]]:
+    prompt_tokens = (
+        _raw_prompt_tokens(assistant_message)
+        if assistant_message is not None
+        else 0
+    )
+    if prompt_tokens <= 0:
+        prompt_tokens = _compressor_prompt_tokens(agent)
+    current_count = _compressor_count(agent)
+    reported_count = int(
+        getattr(agent, "_realshop_reported_compression_count", 0) or 0
+    )
+    context: dict[str, Any] = {}
+    if prompt_tokens > 0:
+        context["tokens"] = prompt_tokens
+    if current_count > reported_count:
+        context["compacted"] = True
+    return context or None
+
+
+def _mark_realshop_context_reported(agent: Any) -> None:
+    current_count = _compressor_count(agent)
+    reported_count = int(
+        getattr(agent, "_realshop_reported_compression_count", 0) or 0
+    )
+    if current_count > reported_count:
+        agent._realshop_reported_compression_count = current_count
+
+
 def _usage_snapshot(agent: Any) -> dict[str, int]:
     return {
         "input": int(getattr(agent, "session_input_tokens", 0) or 0),
@@ -416,6 +478,7 @@ class RealShopHermesAgent(AIAgent):
         self._realshop_step_done = False
         self._realshop_last_act: Optional[dict[str, Any]] = None
         self._realshop_trace_msgs_for_act: list[dict[str, Any]] = []
+        self._realshop_reported_compression_count = _compressor_count(self)
         self.refresh_realshop_tools()
 
     def refresh_realshop_tools(self) -> None:
@@ -483,7 +546,6 @@ class RealShopHermesAgent(AIAgent):
             assistant_msg["reasoning_content"] = reasoning
 
         if messages and isinstance(messages[-1], dict) and messages[-1].get("role") == "assistant":
-            messages[-1] = dict(messages[-1])
             messages[-1]["tool_calls"] = tool_calls
             messages[-1]["tool_origin"] = assistant_msg["tool_origin"]
 
@@ -521,10 +583,13 @@ class RealShopHermesAgent(AIAgent):
                         provider=getattr(self, "provider", None),
                         api_mode=getattr(self, "api_mode", None),
                     )
+                native_context = _realshop_context(self, assistant_message)
                 self.realshop_client.act(
                     token_usage=native_token_usage,
                     messages=trace_messages,
+                    context=native_context,
                 )
+                _mark_realshop_context_reported(self)
             except requests.HTTPError as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if status == 425:
@@ -547,6 +612,7 @@ class RealShopHermesAgent(AIAgent):
         }
         trace_msgs = list(self._realshop_trace_msgs_for_act)
         try:
+            context = _realshop_context(self, assistant_message)
             act_resp = self.realshop_client.act(
                 token_usage=_token_usage(
                     assistant_message,
@@ -554,7 +620,9 @@ class RealShopHermesAgent(AIAgent):
                     api_mode=getattr(self, "api_mode", None),
                 ),
                 messages=[*trace_msgs, realshop_assistant_msg],
+                context=context,
             )
+            _mark_realshop_context_reported(self)
         except requests.HTTPError as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if status == 425:
@@ -590,6 +658,7 @@ def _force_end_of_step(
     reason: str,
     *,
     token_usage: Optional[dict[str, int]] = None,
+    context: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
     assistant_msg = {
         "role": "assistant",
@@ -597,7 +666,11 @@ def _force_end_of_step(
         "tool_origin": REALSHOP_TOOL_ORIGIN,
         "tool_calls": [_end_of_step_tool_call()],
     }
-    act_resp = client.act(messages=[*trace_messages, assistant_msg], token_usage=token_usage)
+    act_resp = client.act(
+        messages=[*trace_messages, assistant_msg],
+        token_usage=token_usage,
+        context=context,
+    )
     history.append(assistant_msg)
     _append_tool_results(history, act_resp)
     return history
@@ -671,7 +744,7 @@ def run(args: argparse.Namespace) -> int:
         stale_step = False
         no_tool_token_usage = None
         agent.refresh_realshop_tools()
-        agent.queue_realshop_trace_messages([observation_msg])
+        agent.queue_realshop_trace_messages([])
         history_before_step = list(history)
         usage_before_step = _usage_snapshot(agent)
         try:
@@ -702,13 +775,16 @@ def run(args: argparse.Namespace) -> int:
                     ),
                 ]
                 no_tool_token_usage = _usage_delta(usage_before_step, agent)
+            fallback_context = _realshop_context(agent)
             history = _force_end_of_step(
                 client,
                 history,
                 agent._realshop_trace_msgs_for_act,
                 "[fallback] Hermes did not call end_of_step; releasing the hook.",
                 token_usage=no_tool_token_usage,
+                context=fallback_context,
             )
+            _mark_realshop_context_reported(agent)
             agent._realshop_trace_msgs_for_act = []
 
         step_count += 1

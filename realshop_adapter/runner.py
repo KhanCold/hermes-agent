@@ -136,7 +136,7 @@ def _tool_call_id(tool_call: Any, index: int) -> str:
 
 def _openai_tool_call(tool_call: Any, index: int) -> dict[str, Any]:
     name = _tool_call_name(tool_call)
-    return {
+    out = {
         "id": _tool_call_id(tool_call, index),
         "type": "function",
         "tool_origin": _tool_origin_for_name(name),
@@ -145,6 +145,14 @@ def _openai_tool_call(tool_call: Any, index: int) -> dict[str, Any]:
             "arguments": _tool_call_arguments(tool_call),
         },
     }
+    extra_content = getattr(tool_call, "extra_content", None)
+    if extra_content is None and isinstance(tool_call, dict):
+        extra_content = tool_call.get("extra_content")
+    if extra_content is not None:
+        if hasattr(extra_content, "model_dump"):
+            extra_content = extra_content.model_dump()
+        out["extra_content"] = extra_content
+    return out
 
 
 def _end_of_step_tool_call() -> dict[str, Any]:

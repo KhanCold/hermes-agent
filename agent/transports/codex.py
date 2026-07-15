@@ -420,7 +420,12 @@ class ResponsesApiTransport(ProviderTransport):
             tool_calls=tool_calls,
             finish_reason=finish_reason or "stop",
             reasoning=msg.reasoning if msg and hasattr(msg, "reasoning") else None,
-            usage=None,  # Codex usage is extracted separately in normalize_usage()
+            # The conversation loop accounts for response usage separately, but
+            # downstream consumers of the normalized assistant message (for
+            # example the RealShop adapter) still need the per-response usage.
+            # Preserve the raw provider shape so each consumer can normalize it
+            # with the correct provider/api-mode semantics.
+            usage=getattr(response, "usage", None),
             provider_data=provider_data or None,
         )
 

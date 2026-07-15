@@ -176,6 +176,48 @@ def test_token_usage_uses_hermes_normalized_cache_and_reasoning_buckets():
     }
 
 
+def test_codex_normalized_response_usage_reaches_realshop_cost_buckets():
+    from agent.transports.codex import ResponsesApiTransport
+
+    raw_usage = SimpleNamespace(
+        input_tokens=1000,
+        output_tokens=100,
+        input_tokens_details=SimpleNamespace(
+            cached_tokens=300,
+            cache_creation_tokens=50,
+        ),
+        output_tokens_details=SimpleNamespace(reasoning_tokens=25),
+    )
+    response = SimpleNamespace(
+        output=[SimpleNamespace(
+            type="function_call",
+            call_id="call_env_0",
+            name="realshop__search_products",
+            arguments='{"query":"toy"}',
+            id="fc_env_0",
+            status="completed",
+        )],
+        status="completed",
+        incomplete_details=None,
+        usage=raw_usage,
+    )
+
+    assistant_message = ResponsesApiTransport().normalize_response(response)
+
+    assert _token_usage(
+        assistant_message,
+        provider="openai",
+        api_mode="codex_responses",
+    ) == {
+        "input": 650,
+        "output": 100,
+        "cache_read": 300,
+        "cache_write": 50,
+        "reasoning": 25,
+        "total": 1100,
+    }
+
+
 def test_native_only_tool_call_is_sent_to_realshop_act_immediately():
     client = FakeRealShopClient()
     agent = RealShopHermesAgent.__new__(RealShopHermesAgent)

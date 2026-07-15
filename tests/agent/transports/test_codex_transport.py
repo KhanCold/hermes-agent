@@ -560,6 +560,12 @@ class TestCodexNormalizeResponse:
 
     def test_text_response(self, transport):
         """Normalize a simple text Codex response."""
+        usage = SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            input_tokens_details=SimpleNamespace(cached_tokens=4),
+            output_tokens_details=None,
+        )
         r = SimpleNamespace(
             output=[
                 SimpleNamespace(
@@ -571,13 +577,13 @@ class TestCodexNormalizeResponse:
             ],
             status="completed",
             incomplete_details=None,
-            usage=SimpleNamespace(input_tokens=10, output_tokens=5,
-                                  input_tokens_details=None, output_tokens_details=None),
+            usage=usage,
         )
         nr = transport.normalize_response(r)
         assert isinstance(nr, NormalizedResponse)
         assert nr.content == "Hello world"
         assert nr.finish_reason == "stop"
+        assert nr.usage is usage
 
     def test_message_items_preserved_in_provider_data(self, transport):
         """Codex assistant message item ids/phases must survive transport normalization."""

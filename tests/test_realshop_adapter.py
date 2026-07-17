@@ -761,6 +761,7 @@ def test_run_does_not_send_observation_back_to_realshop_act(monkeypatch):
             self._realshop_last_act = None
             self._realshop_trace_msgs_for_act = []
             self._realshop_reported_compression_count = 0
+            self.system_messages = []
             self.context_compressor = SimpleNamespace(
                 compression_count=0,
                 last_prompt_tokens=0,
@@ -779,6 +780,7 @@ def test_run_does_not_send_observation_back_to_realshop_act(monkeypatch):
             system_message=None,
             conversation_history=None,
         ):
+            self.system_messages.append(system_message)
             return {
                 "messages": [
                     *(conversation_history or []),
@@ -814,6 +816,11 @@ def test_run_does_not_send_observation_back_to_realshop_act(monkeypatch):
     sent_messages = created["client"].act_calls[0]["messages"]
     assert [m["role"] for m in sent_messages] == ["assistant", "assistant"]
     assert all("Observation text" not in str(m.get("content", "")) for m in sent_messages)
+    assert created["agent"].system_messages == [
+        "system prompt\n\n"
+        "Use any available tools, write and execute code, persist useful memory, "
+        "and improve skills when helpful to maximize final net_assets."
+    ]
 
 
 def test_usage_delta_returns_canonical_session_token_buckets():

@@ -24,6 +24,10 @@ HERMES_TOOL_ORIGIN = "hermes_native"
 IDEALAB_SESSION_HEADER = "x-idealab-session-id"
 IDEALAB_HOST_SUFFIX = "idealab.alibaba-inc.com"
 REALSHOP_SESSION_PREFIX = "realshop-"
+REALSHOP_CAPABILITY_GUIDANCE = (
+    "Use any available tools, write and execute code, persist useful memory, "
+    "and improve skills when helpful to maximize final net_assets."
+)
 log = logging.getLogger(__name__)
 
 
@@ -810,7 +814,10 @@ def run(args: argparse.Namespace) -> int:
 
         brief = obs.get("brief") or {}
         if system_prompt is None and brief.get("system_prompt"):
-            system_prompt = str(brief["system_prompt"])
+            system_prompt = (
+                f"{str(brief['system_prompt']).rstrip()}\n\n"
+                f"{REALSHOP_CAPABILITY_GUIDANCE}"
+            )
 
         observation_msg = {"role": "user", "content": obs.get("text", "") or ""}
         history_len_before_step = len(history)

@@ -2,6 +2,8 @@ import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 
 class StubAIAgent:
     def __init__(self, **kwargs):
@@ -73,6 +75,21 @@ def test_arg_parser_defaults_to_react160k_hop_budget():
     ])
 
     assert args.max_hops_per_step == 30
+
+
+def test_realshop_uses_non_streaming_with_six_api_attempts():
+    agent = RealShopHermesAgent(
+        realshop_client=FakeRealShopClient(),
+        model="gpt-5.5-0424-global",
+        base_url="https://idealab.alibaba-inc.com/api/openai/v1",
+        api_key="test-key",
+        provider=None,
+        quiet=True,
+        max_iterations=30,
+    )
+
+    assert agent._disable_streaming is True
+    assert agent._api_max_retries == 6
 
 
 def test_idealab_runs_add_session_header_to_llm_requests():
@@ -163,6 +180,26 @@ def test_refresh_realshop_tools_exposes_env_names_without_dropping_native_tools(
     assert realshop_tool["x-realshop-tool-name"] == "search_products"
     assert realshop_tool["function"]["x-tool-origin"] == "realshop_env"
     assert realshop_tool["function"]["description"].startswith("[RealShop env]")
+
+
+def test_refresh_realshop_tools_rejects_native_name_collisions():
+    agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
+    agent.realshop_client = FakeRealShopClient()
+    agent._native_tools = [{
+        "type": "function",
+        "function": {
+            "name": "search_products",
+            "description": "A conflicting native tool.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    agent._native_tool_names = {"search_products"}
+
+    with pytest.raises(
+        ValueError,
+        match="RealShop env tool names collide with Hermes native tools: search_products",
+    ):
+        agent.refresh_realshop_tools()
 
 
 def test_legacy_prefixed_end_of_step_alias_dispatches_to_raw_env_name():

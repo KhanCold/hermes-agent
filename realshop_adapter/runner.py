@@ -502,6 +502,11 @@ class RealShopHermesAgent(AIAgent):
                 run_id,
             ),
         )
+        # RealShop runs headlessly, so streaming adds an SSE failure surface
+        # without any user-visible benefit. Retry transient API failures using
+        # the normal non-streaming path instead.
+        self._disable_streaming = True
+        self._api_max_retries = 6
         self.realshop_client = realshop_client
         self._native_tools = list(self.tools or [])
         self._native_tool_names = {

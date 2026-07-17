@@ -111,6 +111,7 @@ def test_realshop_runs_enable_hermes_session_db_recording():
 
     assert agent.init_kwargs["session_id"] == "realshop-run-1"
     assert agent.init_kwargs["platform"] == "realshop"
+    assert agent.init_kwargs["skip_context_files"] is True
     assert isinstance(agent.init_kwargs["session_db"], FakeSessionDB)
 
 
@@ -130,7 +131,7 @@ def test_idealab_non_claude_does_not_force_prompt_cache_markers():
     assert agent._anthropic_prompt_cache_policy() == (False, False)
 
 
-def test_refresh_realshop_tools_appends_prefixed_env_tools_without_dropping_native_tools():
+def test_refresh_realshop_tools_exposes_env_names_without_dropping_native_tools():
     agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
     agent.realshop_client = FakeRealShopClient()
     agent._native_tools = [{
@@ -141,18 +142,84 @@ def test_refresh_realshop_tools_appends_prefixed_env_tools_without_dropping_nati
             "parameters": {"type": "object", "properties": {}},
         },
     }]
+    agent._native_tool_names = {"terminal"}
     agent.tools = list(agent._native_tools)
     agent.valid_tool_names = {"terminal"}
 
     agent.refresh_realshop_tools()
 
     names = [tool["function"]["name"] for tool in agent.tools]
-    assert names == ["terminal", "realshop__search_products"]
-    assert agent.valid_tool_names == {"terminal", "realshop__search_products"}
+    assert names == ["terminal", "search_products"]
+    assert agent.valid_tool_names == {
+        "terminal",
+        "search_products",
+        "realshop__search_products",
+    }
+    assert agent._realshop_tool_names == {
+        "search_products",
+        "realshop__search_products",
+    }
     realshop_tool = agent.tools[1]
     assert realshop_tool["x-realshop-tool-name"] == "search_products"
     assert realshop_tool["function"]["x-tool-origin"] == "realshop_env"
     assert realshop_tool["function"]["description"].startswith("[RealShop env]")
+
+
+def test_legacy_prefixed_end_of_step_alias_dispatches_to_raw_env_name():
+    class ClientWithEndOfStep(FakeRealShopClient):
+        def tools(self):
+            return [
+                *super().tools(),
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "end_of_step",
+                        "description": "Release the current hook.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+            ]
+
+    client = ClientWithEndOfStep()
+    agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
+    agent.realshop_client = client
+    agent.provider = "openai"
+    agent.api_mode = "chat_completions"
+    agent._realshop_step_done = False
+    agent._realshop_last_act = None
+    agent._realshop_trace_msgs_for_act = []
+    agent._native_tools = []
+    agent._native_tool_names = set()
+    agent.tools = []
+    agent.valid_tool_names = set()
+    agent.refresh_realshop_tools()
+
+    assert [tool["function"]["name"] for tool in agent.tools] == [
+        "search_products",
+        "end_of_step",
+    ]
+    assert "realshop__end_of_step" in agent.valid_tool_names
+
+    assistant_message = SimpleNamespace(
+        content="Finish this step.",
+        usage=None,
+        tool_calls=[
+            SimpleNamespace(
+                id="call_end",
+                function=SimpleNamespace(
+                    name="realshop__end_of_step",
+                    arguments="{}",
+                ),
+            )
+        ],
+    )
+    messages = [{"role": "assistant", "content": "Finish this step."}]
+
+    agent._execute_tool_calls(assistant_message, messages, "task-1", 1)
+
+    sent_call = client.act_calls[0]["messages"][-1]["tool_calls"][0]
+    assert sent_call["function"]["name"] == "end_of_step"
+    assert sent_call["hermes_tool_name"] == "realshop__end_of_step"
 
 
 def test_token_usage_uses_hermes_normalized_cache_and_reasoning_buckets():
@@ -228,6 +295,11 @@ def test_native_only_tool_call_is_sent_to_realshop_act_immediately():
     agent._realshop_last_act = None
     agent._realshop_trace_msgs_for_act = []
     agent._native_tools = []
+    agent._native_tool_names = set()
+    agent._realshop_tool_names = {
+        "search_products",
+        "realshop__search_products",
+    }
     agent.tools = []
     agent.valid_tool_names = set()
 
@@ -281,6 +353,11 @@ def test_mixed_native_and_realshop_tool_call_reports_token_usage_once():
     agent._realshop_last_act = None
     agent._realshop_trace_msgs_for_act = []
     agent._native_tools = []
+    agent._native_tool_names = set()
+    agent._realshop_tool_names = {
+        "search_products",
+        "realshop__search_products",
+    }
     agent.tools = []
     agent.valid_tool_names = set()
 
@@ -297,7 +374,7 @@ def test_mixed_native_and_realshop_tool_call_reports_token_usage_once():
             ),
             SimpleNamespace(
                 id="call_env_0",
-                function=SimpleNamespace(name="realshop__search_products", arguments='{"query":"toy"}'),
+                function=SimpleNamespace(name="search_products", arguments='{"query":"toy"}'),
             ),
         ],
     )
@@ -350,7 +427,6 @@ def test_mixed_native_and_realshop_tool_call_reports_token_usage_once():
         "type": "function",
         "tool_origin": "realshop_env",
         "function": {"name": "search_products", "arguments": '{"query":"toy"}'},
-        "hermes_tool_name": "realshop__search_products",
     }]
 
 

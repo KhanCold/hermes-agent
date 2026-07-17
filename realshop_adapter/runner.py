@@ -134,12 +134,17 @@ def _tool_call_id(tool_call: Any, index: int) -> str:
     return f"call_realshop_{int(time.time() * 1000)}_{index}"
 
 
-def _openai_tool_call(tool_call: Any, index: int) -> dict[str, Any]:
+def _openai_tool_call(
+    tool_call: Any,
+    index: int,
+    *,
+    realshop_tool_names: Optional[set[str]] = None,
+) -> dict[str, Any]:
     name = _tool_call_name(tool_call)
     out = {
         "id": _tool_call_id(tool_call, index),
         "type": "function",
-        "tool_origin": _tool_origin_for_name(name),
+        "tool_origin": _tool_origin_for_name(name, realshop_tool_names),
         "function": {
             "name": name,
             "arguments": _tool_call_arguments(tool_call),
@@ -186,13 +191,27 @@ def _assistant_reasoning(assistant_message: Any) -> Optional[str]:
     return None
 
 
-def _tool_origin_for_name(name: str) -> str:
-    return REALSHOP_TOOL_ORIGIN if _is_realshop_tool_name(name) else HERMES_TOOL_ORIGIN
+def _tool_origin_for_name(
+    name: str,
+    realshop_tool_names: Optional[set[str]] = None,
+) -> str:
+    return (
+        REALSHOP_TOOL_ORIGIN
+        if _is_realshop_tool_name(name, realshop_tool_names)
+        else HERMES_TOOL_ORIGIN
+    )
 
 
-def _is_realshop_tool_name(name: str) -> bool:
+def _is_realshop_tool_name(
+    name: str,
+    realshop_tool_names: Optional[set[str]] = None,
+) -> bool:
     name = str(name or "")
-    return name == "end_of_step" or name.startswith(REALSHOP_TOOL_PREFIX)
+    return (
+        name == "end_of_step"
+        or name.startswith(REALSHOP_TOOL_PREFIX)
+        or name in (realshop_tool_names or set())
+    )
 
 
 def _realshop_env_tool_name(name: str) -> str:
@@ -202,12 +221,11 @@ def _realshop_env_tool_name(name: str) -> str:
     return name
 
 
-def _prefixed_realshop_tool(tool: dict[str, Any]) -> dict[str, Any]:
+def _exposed_realshop_tool(tool: dict[str, Any]) -> dict[str, Any]:
     out = dict(tool)
     fn = dict(out.get("function") or {})
     env_name = str(fn.get("name") or "")
-    exposed_name = env_name if env_name == "end_of_step" else f"{REALSHOP_TOOL_PREFIX}{env_name}"
-    fn["name"] = exposed_name
+    fn["name"] = env_name
     fn["description"] = f"[RealShop env] {fn.get('description') or ''}".strip()
     fn["x-tool-origin"] = REALSHOP_TOOL_ORIGIN
     fn["x-realshop-tool-name"] = env_name
@@ -221,10 +239,14 @@ def _realshop_act_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
     out = dict(tool_call)
     fn = dict(out.get("function") or {})
     hermes_name = str(fn.get("name") or "")
-    fn["name"] = _realshop_env_tool_name(hermes_name)
+    env_name = _realshop_env_tool_name(hermes_name)
+    fn["name"] = env_name
     out["function"] = fn
     out["tool_origin"] = REALSHOP_TOOL_ORIGIN
-    out["hermes_tool_name"] = hermes_name
+    if hermes_name != env_name:
+        out["hermes_tool_name"] = hermes_name
+    else:
+        out.pop("hermes_tool_name", None)
     return out
 
 
@@ -377,7 +399,10 @@ def _trace_message(message: dict[str, Any]) -> Optional[dict[str, Any]]:
             name = str((normalized.get("function") or {}).get("name") or normalized.get("name") or "")
             normalized.setdefault("id", f"call_hermes_{int(time.time() * 1000)}_{index}")
             normalized.setdefault("type", "function")
-            normalized["tool_origin"] = _tool_origin_for_name(name)
+            normalized.setdefault(
+                "tool_origin",
+                _tool_origin_for_name(name),
+            )
             normalized_tool_calls.append(normalized)
         if normalized_tool_calls:
             out["tool_calls"] = normalized_tool_calls
@@ -468,6 +493,7 @@ class RealShopHermesAgent(AIAgent):
             max_iterations=max_iterations,
             quiet_mode=quiet,
             save_trajectories=False,
+            skip_context_files=True,
             session_id=_realshop_session_id(run_id),
             session_db=_realshop_session_db(),
             platform="realshop",
@@ -490,14 +516,37 @@ class RealShopHermesAgent(AIAgent):
         self.refresh_realshop_tools()
 
     def refresh_realshop_tools(self) -> None:
-        realshop_tools = [_prefixed_realshop_tool(tool) for tool in self.realshop_client.tools()]
+        realshop_tools = [
+            _exposed_realshop_tool(tool)
+            for tool in self.realshop_client.tools()
+        ]
+        raw_realshop_names = {
+            str((tool.get("function") or {}).get("name"))
+            for tool in realshop_tools
+            if (tool.get("function") or {}).get("name")
+        }
+        collisions = raw_realshop_names & self._native_tool_names
+        if collisions:
+            names = ", ".join(sorted(collisions))
+            raise ValueError(
+                "RealShop env tool names collide with Hermes native tools: "
+                f"{names}"
+            )
+        legacy_prefixed_aliases = {
+            f"{REALSHOP_TOOL_PREFIX}{name}"
+            for name in raw_realshop_names
+        }
+        self._realshop_tool_names = {
+            *raw_realshop_names,
+            *legacy_prefixed_aliases,
+        }
         tools = [*self._native_tools, *realshop_tools]
         self.tools = tools
         self.valid_tool_names = {
             str((tool.get("function") or {}).get("name"))
             for tool in tools
             if (tool.get("function") or {}).get("name")
-        }
+        } | legacy_prefixed_aliases
 
     def _anthropic_prompt_cache_policy(self, *args, **kwargs) -> tuple[bool, bool]:
         base_url = kwargs.get("base_url", getattr(self, "base_url", None))
@@ -521,21 +570,35 @@ class RealShopHermesAgent(AIAgent):
         api_call_count: int = 0,
     ) -> None:
         raw_tool_calls = getattr(assistant_message, "tool_calls", None) or []
+        realshop_tool_names = getattr(self, "_realshop_tool_names", set())
         tool_calls = _reorder_end_of_step_last([
-            _openai_tool_call(tool_call, index)
+            _openai_tool_call(
+                tool_call,
+                index,
+                realshop_tool_names=realshop_tool_names,
+            )
             for index, tool_call in enumerate(raw_tool_calls)
         ])
         realshop_tool_calls = [
             tc for tc in tool_calls
-            if _is_realshop_tool_name((tc.get("function") or {}).get("name", ""))
+            if _is_realshop_tool_name(
+                (tc.get("function") or {}).get("name", ""),
+                realshop_tool_names,
+            )
         ]
         native_raw_tool_calls = [
             tool_call for tool_call in raw_tool_calls
-            if not _is_realshop_tool_name(_tool_call_name(tool_call))
+            if not _is_realshop_tool_name(
+                _tool_call_name(tool_call),
+                realshop_tool_names,
+            )
         ]
         native_tool_calls = [
             tc for tc in tool_calls
-            if not _is_realshop_tool_name((tc.get("function") or {}).get("name", ""))
+            if not _is_realshop_tool_name(
+                (tc.get("function") or {}).get("name", ""),
+                realshop_tool_names,
+            )
         ]
         assistant_msg = {
             "role": "assistant",

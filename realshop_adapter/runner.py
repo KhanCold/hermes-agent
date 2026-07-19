@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -19,6 +20,7 @@ from . import __version__
 
 FRAMEWORK = "hermes"
 DEFAULT_MAX_HOPS_PER_STEP = 30
+REALSHOP_REVIEW_INTERVAL_USER_TURNS = 10
 REALSHOP_TOOL_PREFIX = "realshop__"
 REALSHOP_TOOL_ORIGIN = "realshop_env"
 HERMES_TOOL_ORIGIN = "hermes_native"
@@ -519,6 +521,11 @@ class RealShopHermesAgent(AIAgent):
         # the normal non-streaming path instead.
         self._disable_streaming = True
         self._api_max_retries = 6
+        # RealShop uses one observation/hook as one Hermes user turn.  Align
+        # both self-improvement surfaces to the memory cadence instead of
+        # letting skill review fire on inner tool-loop iterations.
+        self._memory_nudge_interval = REALSHOP_REVIEW_INTERVAL_USER_TURNS
+        self._skill_nudge_interval = 0
         self.realshop_client = realshop_client
         self._native_tools = list(self.tools or [])
         self._native_tool_names = {
@@ -531,6 +538,37 @@ class RealShopHermesAgent(AIAgent):
         self._realshop_trace_msgs_for_act: list[dict[str, Any]] = []
         self._realshop_reported_compression_count = _compressor_count(self)
         self.refresh_realshop_tools()
+
+    def _spawn_background_review(
+        self,
+        messages_snapshot: list[dict[str, Any]],
+        review_memory: bool = False,
+        review_skills: bool = False,
+    ) -> None:
+        """Run each RealShop checkpoint review to completion before returning.
+
+        The normal Hermes review remains asynchronous.  RealShop instead uses
+        the ten-user-turn memory trigger as a combined memory + skills
+        checkpoint, and waits for that review before requesting the next
+        observation.  The review still runs in its own thread so Hermes'
+        thread-local tool and approval isolation is preserved.
+        """
+        from agent.background_review import spawn_background_review_thread
+        from tools.thread_context import propagate_context_to_thread
+
+        target, _prompt = spawn_background_review_thread(
+            self,
+            messages_snapshot,
+            review_memory=True,
+            review_skills=True,
+        )
+        review_thread = threading.Thread(
+            target=propagate_context_to_thread(target),
+            daemon=True,
+            name="realshop-checkpoint-review",
+        )
+        review_thread.start()
+        review_thread.join()
 
     def refresh_realshop_tools(self) -> None:
         realshop_tools = [

@@ -1,4 +1,5 @@
 import sys
+import threading
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -90,6 +91,86 @@ def test_realshop_uses_non_streaming_with_six_api_attempts():
 
     assert agent._disable_streaming is True
     assert agent._api_max_retries == 6
+
+
+def test_realshop_aligns_combined_review_to_ten_user_turn_memory_cadence():
+    agent = RealShopHermesAgent(
+        realshop_client=FakeRealShopClient(),
+        model="gpt-5.5-0424-global",
+        base_url="https://idealab.alibaba-inc.com/api/openai/v1",
+        api_key="test-key",
+        provider=None,
+        quiet=True,
+        max_iterations=30,
+    )
+
+    assert agent._memory_nudge_interval == 10
+    assert agent._skill_nudge_interval == 0
+
+
+def test_realshop_checkpoint_review_is_combined_and_synchronous():
+    agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
+    review_started = threading.Event()
+    release_review = threading.Event()
+    review_completed = threading.Event()
+    method_returned = threading.Event()
+    captured = {}
+
+    def build_review_target(
+        actual_agent,
+        messages_snapshot,
+        *,
+        review_memory,
+        review_skills,
+    ):
+        captured.update({
+            "agent": actual_agent,
+            "messages_snapshot": messages_snapshot,
+            "review_memory": review_memory,
+            "review_skills": review_skills,
+        })
+
+        def target():
+            review_started.set()
+            assert release_review.wait(timeout=1)
+            review_completed.set()
+
+        return target, "combined-review"
+
+    def invoke_review():
+        agent._spawn_background_review(
+            messages_snapshot=[{"role": "user", "content": "checkpoint"}],
+            review_memory=True,
+            review_skills=False,
+        )
+        method_returned.set()
+
+    with (
+        patch(
+            "agent.background_review.spawn_background_review_thread",
+            side_effect=build_review_target,
+        ),
+        patch(
+            "tools.thread_context.propagate_context_to_thread",
+            side_effect=lambda target: target,
+        ),
+    ):
+        caller = threading.Thread(target=invoke_review)
+        caller.start()
+        assert review_started.wait(timeout=1)
+        assert not method_returned.wait(timeout=0.05)
+        release_review.set()
+        caller.join(timeout=1)
+
+    assert not caller.is_alive()
+    assert review_completed.is_set()
+    assert method_returned.is_set()
+    assert captured == {
+        "agent": agent,
+        "messages_snapshot": [{"role": "user", "content": "checkpoint"}],
+        "review_memory": True,
+        "review_skills": True,
+    }
 
 
 def test_idealab_runs_add_session_header_to_llm_requests():

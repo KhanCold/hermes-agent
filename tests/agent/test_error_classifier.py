@@ -1285,6 +1285,28 @@ class TestAdversarialEdgeCases:
         result = classify_api_error(e, provider="openrouter")
         assert result.reason == FailoverReason.rate_limit
 
+    def test_400_with_mpe_429_code(self):
+        """Idealab wraps provider throttling in an HTTP 400 response."""
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={
+                "success": False,
+                "message": "模型提供方限流",
+                "code": "MPE-429",
+                "detailMessage": (
+                    '{"code":"Throttling.AllocationQuota",'
+                    '"message":"Allocated quota exceeded"}'
+                ),
+            },
+        )
+
+        result = classify_api_error(e)
+
+        assert result.status_code == 400
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
     def test_400_with_billing_text(self):
         """Some providers send billing errors as 400."""
         e = MockAPIError(

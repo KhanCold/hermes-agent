@@ -1120,7 +1120,10 @@ def _classify_400(
 
     # Some providers return rate limit / billing errors as 400 instead of 429/402.
     # Check these patterns before falling through to format_error.
-    if any(p in error_msg for p in _RATE_LIMIT_PATTERNS):
+    if (
+        error_code_lower == "mpe-429"
+        or any(p in error_msg for p in _RATE_LIMIT_PATTERNS)
+    ):
         return result_fn(
             FailoverReason.rate_limit,
             retryable=True,

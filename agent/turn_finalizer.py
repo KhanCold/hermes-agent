@@ -27,6 +27,20 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
+class ToolTurnComplete(Exception):
+    """Signal that a tool completed the user turn without another LLM call."""
+
+    def __init__(
+        self,
+        final_response: str = "Tool turn completed.",
+        *,
+        reason: str = "tool_turn_complete",
+    ) -> None:
+        super().__init__(reason)
+        self.final_response = str(final_response or "").strip() or "Tool turn completed."
+        self.reason = str(reason or "tool_turn_complete")
+
+
 def finalize_turn(
     agent,
     *,
@@ -123,12 +137,14 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    normal_tool_completion = str(_turn_exit_reason).startswith("tool_turn_complete")
     completed = (
         final_response is not None
         and not failed
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
+            or normal_tool_completion
         )
     )
 
@@ -224,7 +240,7 @@ def finalize_turn(
         agent.session_id or "none",
     )
 
-    if _last_msg_role == "tool" and not interrupted:
+    if _last_msg_role == "tool" and not interrupted and not normal_tool_completion:
         # Agent was mid-work — this is the "just stops" case.
         logger.warning(
             "Turn ended with pending tool result (agent may appear stuck). "
@@ -286,6 +302,7 @@ def finalize_turn(
                 _is_partial_fragment = (
                     not _is_empty_terminal
                     and not str(_turn_exit_reason).startswith("text_response")
+                    and not normal_tool_completion
                     and len(_stripped) <= 24
                     and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
                 )

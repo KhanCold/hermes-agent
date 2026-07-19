@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import requests
 
 from run_agent import AIAgent
+from agent.turn_finalizer import ToolTurnComplete
 
 from . import __version__
 
@@ -35,11 +36,18 @@ class RealShopStaleStep(BaseException):
     """Raised when RealShop rejects an act turn because the env advanced."""
 
 
-class RealShopToolTurnComplete(BaseException):
+class RealShopToolTurnComplete(ToolTurnComplete):
     """Stop Hermes' inner loop after RealShop marks the hook complete."""
 
-    def __init__(self, messages: list[dict[str, Any]]) -> None:
-        super().__init__("realshop tool turn complete")
+    def __init__(
+        self,
+        messages: list[dict[str, Any]],
+        final_response: str = "",
+    ) -> None:
+        super().__init__(
+            final_response or "RealShop step completed.",
+            reason="tool_turn_complete(realshop_end_of_step)",
+        )
         self.messages = messages
 
 
@@ -719,7 +727,10 @@ class RealShopHermesAgent(AIAgent):
                 self._flush_messages_to_session_db(messages)
             except Exception as exc:
                 log.warning("Hermes SessionDB flush failed after RealShop end_of_step: %s", exc)
-            raise RealShopToolTurnComplete(messages)
+            raise RealShopToolTurnComplete(
+                messages,
+                final_response=_assistant_content(assistant_message),
+            )
 
 
 def _tick_step(obs: dict[str, Any]) -> int:
@@ -740,18 +751,47 @@ def _force_end_of_step(
     token_usage: Optional[dict[str, int]] = None,
     context: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, Any]]:
-    assistant_msg = {
-        "role": "assistant",
-        "content": reason,
-        "tool_origin": REALSHOP_TOOL_ORIGIN,
-        "tool_calls": [_end_of_step_tool_call()],
-    }
+    outbound_messages = list(trace_messages)
+    merge_with_last_assistant = bool(
+        history
+        and isinstance(history[-1], dict)
+        and history[-1].get("role") == "assistant"
+        and not history[-1].get("tool_calls")
+    )
+    if merge_with_last_assistant:
+        assistant_msg = dict(history[-1])
+        content = assistant_msg.get("content")
+        assistant_msg["content"] = (
+            f"{content.rstrip()}\n\n{reason}"
+            if isinstance(content, str) and content.strip()
+            else reason
+        )
+        assistant_msg["tool_origin"] = REALSHOP_TOOL_ORIGIN
+        assistant_msg["tool_calls"] = [_end_of_step_tool_call()]
+        history[-1] = assistant_msg
+        if (
+            outbound_messages
+            and isinstance(outbound_messages[-1], dict)
+            and outbound_messages[-1].get("role") == "assistant"
+            and not outbound_messages[-1].get("tool_calls")
+        ):
+            outbound_messages[-1] = dict(assistant_msg)
+        else:
+            outbound_messages.append(dict(assistant_msg))
+    else:
+        assistant_msg = {
+            "role": "assistant",
+            "content": reason,
+            "tool_origin": REALSHOP_TOOL_ORIGIN,
+            "tool_calls": [_end_of_step_tool_call()],
+        }
+        history.append(assistant_msg)
+        outbound_messages.append(assistant_msg)
     act_resp = client.act(
-        messages=[*trace_messages, assistant_msg],
+        messages=outbound_messages,
         token_usage=token_usage,
         context=context,
     )
-    history.append(assistant_msg)
     _append_tool_results(history, act_resp)
     return history
 
@@ -836,8 +876,6 @@ def run(args: argparse.Namespace) -> int:
                 system_message=system_prompt,
                 conversation_history=history,
             )
-        except RealShopToolTurnComplete as done:
-            history = list(done.messages)
         except RealShopStaleStep:
             history = history[:history_len_before_step]
             stale_step = True

@@ -25,6 +25,7 @@ from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.turn_finalizer import ToolTurnComplete
 
 
 # ---------------------------------------------------------------------------
@@ -3772,6 +3773,47 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
+
+    def test_tool_turn_complete_runs_finalizer_and_background_review(self, agent):
+        self._setup_agent(agent)
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        response = _mock_response(
+            content="Step complete.",
+            finish_reason="tool_calls",
+            tool_calls=[tc],
+        )
+        agent.client.chat.completions.create.return_value = response
+        agent.valid_tool_names.add("skill_manage")
+        agent._skill_nudge_interval = 1
+        agent._iters_since_skill = 1
+
+        def complete_turn(_assistant_message, messages, _task_id, _api_call_count=0):
+            messages.append({
+                "role": "tool",
+                "name": "web_search",
+                "tool_call_id": "c1",
+                "content": "done",
+            })
+            raise ToolTurnComplete(
+                "Step complete.",
+                reason="tool_turn_complete(test)",
+            )
+
+        with (
+            patch.object(agent, "_execute_tool_calls", side_effect=complete_turn),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(agent, "_spawn_background_review") as spawn_review,
+        ):
+            result = agent.run_conversation("finish the step")
+
+        assert result["final_response"] == "Step complete."
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "tool_turn_complete(test)"
+        assert result["api_calls"] == 1
+        spawn_review.assert_called_once()
+        assert spawn_review.call_args.kwargs["review_skills"] is True
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)

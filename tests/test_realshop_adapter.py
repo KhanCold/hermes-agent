@@ -590,11 +590,11 @@ def test_realshop_end_of_step_flushes_tool_results_to_session_db():
     )
     messages = [{"role": "assistant", "content": "Release the hook."}]
 
-    try:
+    with pytest.raises(RealShopToolTurnComplete) as completed:
         agent._execute_tool_calls(assistant_message, messages, "task-1", 1)
-    except RealShopToolTurnComplete:
-        pass
 
+    assert completed.value.final_response == "Release the hook."
+    assert completed.value.reason == "tool_turn_complete(realshop_end_of_step)"
     assert flushed
     assert [m["role"] for m in flushed[0][-2:]] == ["assistant", "tool"]
     assert flushed[0][-1]["tool_call_id"] == "call_eos_0"
@@ -705,11 +705,10 @@ def test_no_tool_assistant_trace_can_be_flushed_with_fallback_end_of_step():
     )
 
     stored = client.act_calls[0]["messages"]
-    assert [m["role"] for m in stored] == ["assistant", "assistant"]
-    assert stored[0]["content"] == "I need more data."
-    assert stored[0]["tool_origin"] == "hermes_native"
-    assert stored[1]["tool_origin"] == "realshop_env"
-    assert stored[1]["tool_calls"][0]["function"]["name"] == "end_of_step"
+    assert [m["role"] for m in stored] == ["assistant"]
+    assert stored[0]["content"].startswith("I need more data.\n\n[fallback]")
+    assert stored[0]["tool_origin"] == "realshop_env"
+    assert stored[0]["tool_calls"][0]["function"]["name"] == "end_of_step"
     assert client.act_calls[0]["token_usage"] == {
         "input": 11,
         "output": 7,
@@ -814,7 +813,8 @@ def test_run_does_not_send_observation_back_to_realshop_act(monkeypatch):
     assert run(args) == 0
 
     sent_messages = created["client"].act_calls[0]["messages"]
-    assert [m["role"] for m in sent_messages] == ["assistant", "assistant"]
+    assert [m["role"] for m in sent_messages] == ["assistant"]
+    assert sent_messages[0]["tool_calls"][0]["function"]["name"] == "end_of_step"
     assert all("Observation text" not in str(m.get("content", "")) for m in sent_messages)
     assert created["agent"].system_messages == [
         "system prompt\n\n"

@@ -33,6 +33,7 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
+from agent.turn_finalizer import ToolTurnComplete
 from agent.turn_retry_state import TurnRetryState
 from agent.memory_manager import build_memory_context_block
 from agent.message_sanitization import (
@@ -4397,7 +4398,18 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                try:
+                    agent._execute_tool_calls(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                except ToolTurnComplete as completion:
+                    final_response = completion.final_response
+                    _turn_exit_reason = completion.reason
+                    agent._session_messages = messages
+                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

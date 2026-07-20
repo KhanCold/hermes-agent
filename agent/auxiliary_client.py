@@ -3081,8 +3081,12 @@ def _retry_same_provider_sync(
     )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
-    return _validate_llm_response(
-        retry_client.chat.completions.create(**retry_kwargs), task,
+    return _validate_with_billing_identity(
+        retry_client.chat.completions.create(**retry_kwargs),
+        task,
+        provider=resolved_provider,
+        model=retry_kwargs.get("model") or retry_model or final_model,
+        client=retry_client,
     )
 
 
@@ -3673,6 +3677,17 @@ def _resolve_auto(
     # config.yaml (auxiliary.<task>.provider) still win over this.
     main_provider = str(runtime_provider or _read_main_provider() or "")
     main_model = str(runtime_model or _read_main_model() or "")
+
+    # A live OpenAI-compatible session does not need a named provider: its
+    # explicit endpoint, model, and credentials already describe a complete
+    # runtime.  Adapters commonly construct AIAgent this way (provider=None,
+    # base_url=<gateway>); treating the empty provider as "no main backend"
+    # made auxiliary=auto skip the working endpoint and left compression with
+    # no client.  Route that live runtime through the existing custom-provider
+    # path so auxiliary work reuses the exact foreground endpoint.
+    if (main_provider in {"", "auto"}
+            and runtime_base_url and main_model):
+        main_provider = "custom"
 
     # MoA virtual provider: the "model" is a preset name (e.g. "opus-gpt") and
     # there is no real "moa" HTTP endpoint, so resolving an aux client against
@@ -5638,6 +5653,51 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
     return response
 
 
+_AUXILIARY_BILLING_LOCAL = threading.local()
+
+
+def _validate_with_billing_identity(
+    response: Any,
+    task: Optional[str],
+    *,
+    provider: Optional[str],
+    model: Optional[str],
+    client: Any,
+) -> Any:
+    """Validate a response and retain its actual in-process billing route."""
+    validated = _validate_llm_response(response, task)
+    actual_model = str(getattr(validated, "model", None) or model or "")
+    base_url = str(getattr(client, "base_url", "") or "")
+    actual_provider = str(provider or "")
+    if actual_provider.strip().lower() in {"", "auto"} and base_url:
+        try:
+            from agent.model_metadata import _infer_provider_from_url
+
+            actual_provider = str(
+                _infer_provider_from_url(base_url) or actual_provider
+            )
+        except Exception:
+            pass
+    identity = {
+        "provider": actual_provider,
+        "model": actual_model,
+        "base_url": base_url,
+        # Kept only in thread-local process memory so provider model-metadata
+        # lookups can authenticate; never copy this field into usage records.
+        "api_key": str(getattr(client, "api_key", "") or ""),
+    }
+    _AUXILIARY_BILLING_LOCAL.response = validated
+    _AUXILIARY_BILLING_LOCAL.identity = identity
+    return validated
+
+
+def get_auxiliary_billing_identity(response: Any) -> Dict[str, str]:
+    """Return billing identity captured for this exact synchronous response."""
+    if getattr(_AUXILIARY_BILLING_LOCAL, "response", None) is not response:
+        return {}
+    return dict(getattr(_AUXILIARY_BILLING_LOCAL, "identity", {}) or {})
+
+
 def _recover_aux_response_message(response: Any) -> Optional[Any]:
     """Synthesize chat-completions shape from Responses-style text fields.
 
@@ -5871,8 +5931,10 @@ def call_llm(
         # every auxiliary task (compression, memory flush, title-gen,
         # session-search, vision) shares. (PR #16587)
         try:
-            return _validate_llm_response(
-                client.chat.completions.create(**kwargs), task)
+            return _validate_with_billing_identity(
+                client.chat.completions.create(**kwargs), task,
+                provider=resolved_provider, model=kwargs.get("model"), client=client,
+            )
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -5896,8 +5958,10 @@ def call_llm(
                 "the same provider before fallback: %s",
                 task or "call", transient_err,
             )
-            return _validate_llm_response(
-                client.chat.completions.create(**kwargs), task)
+            return _validate_with_billing_identity(
+                client.chat.completions.create(**kwargs), task,
+                provider=resolved_provider, model=kwargs.get("model"), client=client,
+            )
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -5907,8 +5971,12 @@ def call_llm(
                 task or "call",
             )
             try:
-                return _validate_llm_response(
-                    client.chat.completions.create(**retry_kwargs), task)
+                return _validate_with_billing_identity(
+                    client.chat.completions.create(**retry_kwargs), task,
+                    provider=resolved_provider,
+                    model=retry_kwargs.get("model"),
+                    client=client,
+                )
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 # If retry still fails, fall through to the max_tokens /
@@ -5945,8 +6013,12 @@ def call_llm(
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
             try:
-                return _validate_llm_response(
-                    client.chat.completions.create(**kwargs), task)
+                return _validate_with_billing_identity(
+                    client.chat.completions.create(**kwargs), task,
+                    provider=resolved_provider,
+                    model=kwargs.get("model"),
+                    client=client,
+                )
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -5975,8 +6047,12 @@ def call_llm(
                 )
                 kwargs["model"] = healed_model
                 try:
-                    return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                    return _validate_with_billing_identity(
+                        client.chat.completions.create(**kwargs), task,
+                        provider=resolved_provider,
+                        model=kwargs.get("model"),
+                        client=client,
+                    )
                 except Exception as retry_err:
                     first_err = retry_err
 
@@ -6008,8 +6084,12 @@ def call_llm(
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
                 try:
-                    return _validate_llm_response(
-                        refreshed_client.chat.completions.create(**kwargs), task)
+                    return _validate_with_billing_identity(
+                        refreshed_client.chat.completions.create(**kwargs), task,
+                        provider=resolved_provider,
+                        model=kwargs.get("model"),
+                        client=refreshed_client,
+                    )
                 except Exception as retry_err:
                     if not (
                         _is_auth_error(retry_err)
@@ -6036,8 +6116,12 @@ def call_llm(
                             task or "call")
                 if refreshed_model and refreshed_model != kwargs.get("model"):
                     kwargs["model"] = refreshed_model
-                return _validate_llm_response(
-                    refreshed_client.chat.completions.create(**kwargs), task)
+                return _validate_with_billing_identity(
+                    refreshed_client.chat.completions.create(**kwargs), task,
+                    provider=resolved_provider,
+                    model=kwargs.get("model"),
+                    client=refreshed_client,
+                )
 
         # ── Auth refresh retry ───────────────────────────────────────
         if (_is_auth_error(first_err)
@@ -6078,8 +6162,12 @@ def call_llm(
             # won't accept another request with the same exhausted key.
             if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
                 try:
-                    return _validate_llm_response(
-                        client.chat.completions.create(**kwargs), task)
+                    return _validate_with_billing_identity(
+                        client.chat.completions.create(**kwargs), task,
+                        provider=resolved_provider,
+                        model=kwargs.get("model"),
+                        client=client,
+                    )
                 except Exception as retry_err:
                     if not (_is_auth_error(retry_err) or _is_payment_error(retry_err) or _is_rate_limit_error(retry_err)):
                         raise
@@ -6227,8 +6315,12 @@ def call_llm(
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     base_url=str(getattr(fb_client, "base_url", "") or ""))
-                return _validate_llm_response(
-                    fb_client.chat.completions.create(**fb_kwargs), task)
+                return _validate_with_billing_identity(
+                    fb_client.chat.completions.create(**fb_kwargs), task,
+                    provider=fb_label,
+                    model=fb_kwargs.get("model") or fb_model,
+                    client=fb_client,
+                )
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.

@@ -2,6 +2,7 @@
 
 import pytest
 import time
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 from agent.context_compressor import (
@@ -10,6 +11,14 @@ from agent.context_compressor import (
     SUMMARY_PREFIX,
 )
 from hermes_state import SessionDB
+
+
+@pytest.fixture(autouse=True)
+def _skip_summary_retry_sleep(monkeypatch):
+    monkeypatch.setattr(
+        "agent.context_compressor._sleep_before_summary_retry",
+        lambda _delay: None,
+    )
 
 
 @pytest.fixture()
@@ -400,6 +409,191 @@ class TestGenerateSummaryNoneContent:
         assert isinstance(summary, str)
         assert summary.startswith(SUMMARY_PREFIX)
 
+    def test_summary_response_usage_is_accumulated_for_harness_reporting(self):
+        mock_response = SimpleNamespace(
+            model="routed-summary-model",
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="compact checkpoint"),
+            )],
+            usage=SimpleNamespace(
+                prompt_tokens=1000,
+                completion_tokens=100,
+                prompt_tokens_details=SimpleNamespace(
+                    cached_tokens=300,
+                    cache_creation_tokens=50,
+                ),
+                output_tokens_details=SimpleNamespace(reasoning_tokens=25),
+            ),
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                provider="openai",
+                api_mode="chat_completions",
+                quiet_mode=True,
+            )
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            summary = c._generate_summary([
+                {"role": "user", "content": "do something"},
+                {"role": "assistant", "content": "done"},
+            ])
+
+        assert summary is not None
+        assert c.summary_usage_snapshot() == {
+            "input": 650,
+            "output": 100,
+            "cache_read": 300,
+            "cache_write": 50,
+            "reasoning": 25,
+            "total": 1100,
+        }
+        record = c.summary_usage_records_snapshot()[0]
+        assert record["token_usage"]["total"] == 1100
+        assert record["model"] == "routed-summary-model"
+        assert record["provider"] == ""
+        assert record["cost_status"] == "unknown"
+        assert record["cost_usd"] is None
+
+    @pytest.mark.parametrize(
+        ("provider", "api_mode"),
+        [
+            ("anthropic", "anthropic_messages"),
+            ("openai", "codex_responses"),
+        ],
+    )
+    def test_summary_usage_uses_auxiliary_openai_shape_not_main_transport(
+        self,
+        provider,
+        api_mode,
+    ):
+        response = SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=123, completion_tokens=7),
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                provider=provider,
+                api_mode=api_mode,
+                quiet_mode=True,
+            )
+
+        c._record_summary_response_usage(response)
+
+        assert c.summary_usage_snapshot() == {
+            "input": 123,
+            "output": 7,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0,
+            "total": 130,
+        }
+
+    def test_summary_usage_uses_resolved_auxiliary_billing_identity(self):
+        response = SimpleNamespace(
+            model="resolved-summary-model",
+            usage=SimpleNamespace(prompt_tokens=123, completion_tokens=7),
+        )
+        identity = {
+            "provider": "openrouter",
+            "model": "provider/resolved-summary-model",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "runtime-only-key",
+        }
+        cost_result = SimpleNamespace(
+            status="estimated",
+            source="provider_models_api",
+            amount_usd=0.0042,
+        )
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100000,
+        ):
+            c = ContextCompressor(
+                model="main-model",
+                provider="custom",
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.get_auxiliary_billing_identity",
+            return_value=identity,
+        ), patch(
+            "agent.usage_pricing.estimate_usage_cost",
+            return_value=cost_result,
+        ) as estimate:
+            c._record_summary_response_usage(response)
+
+        record = c.summary_usage_records_snapshot()[0]
+        assert record["model"] == "provider/resolved-summary-model"
+        assert record["provider"] == "openrouter"
+        assert record["cost_usd"] == 0.0042
+        assert "api_key" not in record
+        assert estimate.call_args.kwargs == {
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "runtime-only-key",
+        }
+
+    def test_billed_empty_summary_response_usage_is_still_accumulated(self):
+        mock_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="  "))],
+            usage=SimpleNamespace(prompt_tokens=80, completion_tokens=2),
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                provider="openai",
+                api_mode="chat_completions",
+                quiet_mode=True,
+            )
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            summary = c._generate_summary([
+                {"role": "user", "content": "do something"},
+                {"role": "assistant", "content": "done"},
+            ])
+
+        assert summary is None
+        assert c.summary_usage_snapshot() == {
+            "input": 240,
+            "output": 6,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0,
+            "total": 246,
+        }
+
+    def test_summary_retries_any_exception_with_exponential_backoff(self):
+        ok = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="summary after retries"),
+            )],
+            usage=SimpleNamespace(prompt_tokens=20, completion_tokens=5),
+        )
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=[
+                Exception("402 temporary balance error"),
+                Exception("401 temporary channel error"),
+                ok,
+            ],
+        ) as mock_call, patch(
+            "agent.context_compressor._sleep_before_summary_retry",
+        ) as mock_sleep:
+            summary = c._generate_summary([
+                {"role": "user", "content": "do something"},
+                {"role": "assistant", "content": "done"},
+            ])
+
+        assert summary is not None
+        assert mock_call.call_count == 3
+        assert [call.args[0] for call in mock_sleep.call_args_list] == [1, 2]
+        assert c.summary_usage_snapshot()["total"] == 25
+
     def test_none_content_in_system_message_compress(self):
         """System message with content=None should not crash during compress."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
@@ -504,8 +698,8 @@ class TestNonStringContent:
 
         with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
             summary = c._generate_summary(messages)
-        # Two calls: aux model (glm-5.1) then fallback to main (glm-5).
-        assert mock_call.call_count == 2
+        # One aux call, then three attempts on the main model.
+        assert mock_call.call_count == 4
         assert c._summary_model_fallen_back is True
         assert summary is None
         assert c._summary_failure_cooldown_until > 0
@@ -619,7 +813,7 @@ class TestSummaryFailureCooldown:
 
         assert first is None
         assert second is None
-        assert mock_call.call_count == 1
+        assert mock_call.call_count == 3
 
 
 class TestAuthFailureAborts:
@@ -871,8 +1065,8 @@ class TestSummaryFallbackToMainModel:
         ) as mock_call:
             result = c._generate_summary(self._msgs())
 
-        # Only one attempt — retry gate blocks fallback when models match
-        assert mock_call.call_count == 1
+        # Same model receives the full three-attempt budget, with no fallback.
+        assert mock_call.call_count == 3
         assert result is None
         # Not flagged as fallen back — the retry condition was never met
         assert getattr(c, "_summary_model_fallen_back", False) is False
@@ -892,12 +1086,12 @@ class TestSummaryFallbackToMainModel:
 
         with patch(
             "agent.context_compressor.call_llm",
-            side_effect=[err1, err2],
+            side_effect=[err1, err2, err2, err2],
         ) as mock_call:
             result = c._generate_summary(self._msgs())
 
-        # Exactly 2 calls: initial + one retry on main.  No further retries.
-        assert mock_call.call_count == 2
+        # One auxiliary attempt, then three attempts on main. No recursion.
+        assert mock_call.call_count == 4
         assert result is None
         assert c._summary_model_fallen_back is True
 

@@ -38,7 +38,11 @@ from realshop_adapter.runner import (
     build_arg_parser,
     run,
     _force_end_of_step,
+    _flush_pending_auxiliary_usage,
     _new_trace_messages,
+    _realshop_token_usage,
+    _sanitize_realshop_agent_history,
+    _sanitize_realshop_history,
     _token_usage,
     _usage_delta,
 )
@@ -47,7 +51,16 @@ from realshop_adapter.runner import (
 class FakeRealShopClient:
     def __init__(self):
         self.run_id = "run-1"
+        self.agent_id = "agent_0"
         self.act_calls = []
+        self.usage_calls = []
+
+    def latest_env_t(self):
+        return 12
+
+    def record_usage(self, usage, **kwargs):
+        self.usage_calls.append((dict(usage), dict(kwargs)))
+        return {"ok": True, "recorded": True}
 
     def tools(self):
         return [{
@@ -104,12 +117,15 @@ def test_realshop_aligns_combined_review_to_ten_user_turn_memory_cadence():
         max_iterations=30,
     )
 
-    assert agent._memory_nudge_interval == 10
+    assert agent._memory_nudge_interval == 100
     assert agent._skill_nudge_interval == 0
 
 
 def test_realshop_checkpoint_review_is_combined_and_synchronous():
     agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
+    agent.realshop_client = FakeRealShopClient()
+    agent._realshop_review_usage_lock = threading.Lock()
+    agent._realshop_review_usage_batches = []
     review_started = threading.Event()
     release_review = threading.Event()
     review_completed = threading.Event()
@@ -122,12 +138,14 @@ def test_realshop_checkpoint_review_is_combined_and_synchronous():
         *,
         review_memory,
         review_skills,
+        usage_callback,
     ):
         captured.update({
             "agent": actual_agent,
             "messages_snapshot": messages_snapshot,
             "review_memory": review_memory,
             "review_skills": review_skills,
+            "usage_callback": usage_callback,
         })
 
         def target():
@@ -165,12 +183,13 @@ def test_realshop_checkpoint_review_is_combined_and_synchronous():
     assert not caller.is_alive()
     assert review_completed.is_set()
     assert method_returned.is_set()
-    assert captured == {
-        "agent": agent,
-        "messages_snapshot": [{"role": "user", "content": "checkpoint"}],
-        "review_memory": True,
-        "review_skills": True,
-    }
+    assert captured["agent"] is agent
+    assert captured["messages_snapshot"] == [
+        {"role": "user", "content": "checkpoint"}
+    ]
+    assert captured["review_memory"] is True
+    assert captured["review_skills"] is True
+    assert captured["usage_callback"].__self__ is agent
 
 
 def test_idealab_runs_add_session_header_to_llm_requests():
@@ -358,6 +377,278 @@ def test_token_usage_uses_hermes_normalized_cache_and_reasoning_buckets():
         "cache_write": 50,
         "reasoning": 25,
         "total": 1100,
+    }
+
+
+def test_foreground_act_usage_excludes_auxiliary_usage():
+    agent = SimpleNamespace()
+    foreground = {
+        "input": 100,
+        "output": 20,
+        "cache_read": 40,
+        "cache_write": 0,
+        "reasoning": 5,
+        "total": 160,
+    }
+
+    assert _realshop_token_usage(agent, foreground) == foreground
+    assert _realshop_token_usage(agent, None) is None
+
+
+def test_checkpoint_review_usage_uses_idempotent_auxiliary_ledger():
+    agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
+    agent._user_turn_count = 10
+    agent._realshop_review_usage_lock = threading.Lock()
+    agent._realshop_review_usage_batches = []
+    client = FakeRealShopClient()
+    agent.realshop_client = client
+
+    review_usage = {
+        "input": 700,
+        "output": 40,
+        "cache_read": 200,
+        "cache_write": 25,
+        "reasoning": 10,
+        "total": 975,
+        "model": "cheap-review-model",
+        "provider": "review-provider",
+        "cost_usd": 0.123,
+        "cost_status": "estimated",
+        "cost_source": "official_docs_snapshot",
+    }
+    agent._record_background_review_usage({**review_usage, "request_index": 1})
+    # Identical token counts in one review are still distinct billable calls.
+    agent._record_background_review_usage({**review_usage, "request_index": 2})
+    _flush_pending_auxiliary_usage(agent, client)
+    _flush_pending_auxiliary_usage(agent, client)
+
+    assert len(client.usage_calls) == 2
+    usage, kwargs = client.usage_calls[0]
+    assert usage["total"] == 975
+    assert kwargs["source"] == "checkpoint_review"
+    assert kwargs["model"] == "cheap-review-model"
+    assert kwargs["cost_usd"] == 0.123
+    assert kwargs["usage_id"].startswith("checkpoint-review-turn-10-call-1-")
+    assert client.usage_calls[1][1]["usage_id"].startswith(
+        "checkpoint-review-turn-10-call-2-"
+    )
+    assert client.usage_calls[0][1]["usage_id"] != (
+        client.usage_calls[1][1]["usage_id"]
+    )
+    assert agent._realshop_review_usage_batches == []
+
+
+def test_final_checkpoint_review_usage_flushes_without_another_act():
+    class UsageClient:
+        run_id = "run-1"
+        agent_id = "agent_0"
+
+        def __init__(self):
+            self.calls = []
+            self.current_step = 2148
+            self.fail = True
+
+        def latest_env_t(self):
+            return self.current_step
+
+        def record_usage(self, usage, **kwargs):
+            self.calls.append((dict(usage), dict(kwargs)))
+            if self.fail:
+                self.current_step = 2160
+                raise ConnectionError("response lost after server commit")
+            return {"ok": True, "recorded": True}
+
+    client = UsageClient()
+    agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
+    agent.realshop_client = client
+    agent.context_compressor = None
+    agent._realshop_reported_summary_record_count = 0
+    agent._user_turn_count = 180
+    agent._realshop_review_usage_lock = threading.Lock()
+    agent._realshop_review_usage_batches = []
+    agent._record_background_review_usage({
+        "input": 700,
+        "output": 40,
+        "cache_read": 200,
+        "cache_write": 25,
+        "reasoning": 10,
+        "total": 975,
+        "model": "main-model",
+        "provider": "custom",
+    })
+    _flush_pending_auxiliary_usage(agent, client, attempts=1)
+    client.fail = False
+    _flush_pending_auxiliary_usage(agent, client, attempts=1)
+
+    assert len(client.calls) == 2
+    assert client.calls[0][1]["usage_id"] == client.calls[1][1]["usage_id"]
+    usage, kwargs = client.calls[-1]
+    assert usage["total"] == 975
+    assert kwargs["source"] == "checkpoint_review"
+    assert client.calls[0][1]["step"] == 2148
+    assert client.calls[1][1]["step"] == 2148
+    assert kwargs["usage_id"].startswith("checkpoint-review-turn-180-")
+
+
+def test_compression_retry_keeps_the_original_observation_step():
+    record = {
+        "token_usage": {"input": 80, "output": 10, "total": 90},
+        "model": "summary-model",
+    }
+
+    class UsageClient(FakeRealShopClient):
+        def __init__(self):
+            super().__init__()
+            self.current_step = 12
+            self.fail = True
+
+        def latest_env_t(self):
+            return self.current_step
+
+        def record_usage(self, usage, **kwargs):
+            self.usage_calls.append((dict(usage), dict(kwargs)))
+            if self.fail:
+                self.current_step = 24
+                raise ConnectionError("response lost")
+            return {"ok": True, "recorded": True}
+
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(
+            summary_usage_records_snapshot=lambda: [dict(record)],
+        ),
+        _realshop_reported_summary_record_count=0,
+        _realshop_summary_usage_steps={},
+        _realshop_review_usage_lock=threading.Lock(),
+        _realshop_review_usage_batches=[],
+    )
+    client = UsageClient()
+
+    _flush_pending_auxiliary_usage(agent, client, attempts=1)
+    client.fail = False
+    _flush_pending_auxiliary_usage(agent, client, attempts=1)
+
+    assert len(client.usage_calls) == 2
+    assert client.usage_calls[0][1]["step"] == 12
+    assert client.usage_calls[1][1]["step"] == 12
+    assert client.usage_calls[0][1]["usage_id"] == (
+        client.usage_calls[1][1]["usage_id"]
+    )
+
+
+def test_compression_usage_id_changes_after_adapter_restart():
+    record = {
+        "token_usage": {"input": 80, "output": 10, "total": 90},
+        "model": "summary-model",
+    }
+
+    def make_agent(session_id):
+        return SimpleNamespace(
+            context_compressor=SimpleNamespace(
+                summary_usage_records_snapshot=lambda: [dict(record)],
+            ),
+            _realshop_reported_summary_record_count=0,
+            _realshop_summary_usage_steps={},
+            _realshop_usage_session_id=session_id,
+            _realshop_review_usage_lock=threading.Lock(),
+            _realshop_review_usage_batches=[],
+        )
+
+    first_client = FakeRealShopClient()
+    resumed_client = FakeRealShopClient()
+    _flush_pending_auxiliary_usage(
+        make_agent("adapter-process-1"), first_client, attempts=1
+    )
+    _flush_pending_auxiliary_usage(
+        make_agent("adapter-process-2"), resumed_client, attempts=1
+    )
+
+    first_kwargs = first_client.usage_calls[0][1]
+    resumed_kwargs = resumed_client.usage_calls[0][1]
+    assert first_kwargs["step"] == resumed_kwargs["step"] == 12
+    assert first_kwargs["usage_id"] != resumed_kwargs["usage_id"]
+
+
+def test_realshop_reports_compression_separately_from_foreground_act():
+    client = FakeRealShopClient()
+    summary_record = {
+        "token_usage": {
+            "input": 80, "output": 10, "cache_read": 0,
+            "cache_write": 0, "reasoning": 0, "total": 90,
+        },
+        "model": "summary-model",
+        "provider": "summary-provider",
+        "cost_usd": 0.05,
+        "cost_status": "estimated",
+        "cost_source": "model_catalog",
+    }
+    agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
+    agent.realshop_client = client
+    agent.provider = "openai"
+    agent.api_mode = "chat_completions"
+    agent._realshop_step_done = False
+    agent._realshop_last_act = None
+    agent._realshop_trace_msgs_for_act = []
+    agent._native_tools = []
+    agent._realshop_tool_names = {
+        "search_products",
+        "realshop__search_products",
+    }
+    agent.tools = []
+    agent.valid_tool_names = set()
+    agent.context_compressor = SimpleNamespace(
+        compression_count=0,
+        last_prompt_tokens=0,
+        summary_usage_records_snapshot=lambda: [dict(summary_record)],
+    )
+    agent._realshop_reported_compression_count = 0
+    agent._realshop_reported_summary_record_count = 0
+    agent._realshop_review_usage_lock = threading.Lock()
+    agent._realshop_review_usage_batches = []
+
+    def assistant(call_id):
+        return SimpleNamespace(
+            content="Search the catalog.",
+            usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20),
+            tool_calls=[SimpleNamespace(
+                id=call_id,
+                function=SimpleNamespace(
+                    name="search_products",
+                    arguments='{"query":"toy"}',
+                ),
+            )],
+        )
+
+    agent._execute_tool_calls(
+        assistant("call_env_1"),
+        [{"role": "assistant", "content": "Search the catalog."}],
+        "task-1",
+        1,
+    )
+    agent._execute_tool_calls(
+        assistant("call_env_2"),
+        [{"role": "assistant", "content": "Search again."}],
+        "task-1",
+        2,
+    )
+
+    assert len(client.usage_calls) == 1
+    assert client.usage_calls[0][0]["total"] == 90
+    assert client.usage_calls[0][1]["source"] == "context_compression"
+    assert client.act_calls[0]["token_usage"] == {
+        "input": 100,
+        "output": 20,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0,
+        "total": 120,
+    }
+    assert client.act_calls[1]["token_usage"] == {
+        "input": 100,
+        "output": 20,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0,
+        "total": 120,
     }
 
 
@@ -817,6 +1108,130 @@ def test_new_trace_messages_can_exclude_observation_already_recorded_by_env():
     assert [m["role"] for m in trace] == ["assistant"]
     assert trace[0]["content"] == "I need more data."
     assert trace[0]["tool_origin"] == "hermes_native"
+
+
+def test_realshop_history_drops_pure_end_of_step_and_fallback_result():
+    history = [
+        {"role": "user", "content": "observation"},
+        {
+            "role": "assistant",
+            "content": "[fallback] Hermes did not call end_of_step; releasing the hook.",
+            "tool_origin": "realshop_env",
+            "tool_calls": [{
+                "id": "call_eos",
+                "type": "function",
+                "function": {"name": "end_of_step", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_eos",
+            "name": "end_of_step",
+            "content": '{"ok": true}',
+        },
+    ]
+
+    assert _sanitize_realshop_history(history) == []
+
+
+def test_realshop_history_keeps_business_call_but_removes_eos_and_orphans():
+    history = [
+        {
+            "role": "assistant",
+            "content": "Checked the catalog.",
+            "tool_calls": [
+                {
+                    "id": "call_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_products",
+                        "arguments": '{"query":"sports"}',
+                    },
+                },
+                {
+                    "id": "call_eos",
+                    "type": "function",
+                    "function": {"name": "end_of_step", "arguments": "{}"},
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_search",
+            "name": "search_products",
+            "content": '{"items": []}',
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_eos",
+            "name": "end_of_step",
+            "content": '{"ok": true}',
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_old",
+            "name": "query_supply_chain_anomalies",
+            "content": "stale result",
+        },
+    ]
+
+    cleaned = _sanitize_realshop_history(history)
+
+    assert [m["role"] for m in cleaned] == ["assistant", "tool"]
+    assert [
+        call["function"]["name"]
+        for call in cleaned[0]["tool_calls"]
+    ] == ["search_products"]
+    assert cleaned[1]["tool_call_id"] == "call_search"
+
+
+def test_realshop_history_preserves_semantic_text_from_pure_eos_turn():
+    history = [{
+        "role": "assistant",
+        "content": "No changes needed.\n\n[fallback] releasing the hook.",
+        "tool_calls": [{
+            "id": "call_eos",
+            "type": "function",
+            "function": {"name": "realshop__end_of_step", "arguments": "{}"},
+        }],
+    }]
+
+    assert _sanitize_realshop_history(history) == [{
+        "role": "assistant",
+        "content": "No changes needed.",
+    }]
+
+
+def test_realshop_history_reconciles_session_db_message_identities():
+    retained = {"role": "system", "content": "system prompt"}
+    observation = {"role": "user", "content": "observation"}
+    eos = {
+        "role": "assistant",
+        "content": "[fallback] releasing the hook.",
+        "tool_calls": [{
+            "id": "call_eos",
+            "type": "function",
+            "function": {"name": "end_of_step", "arguments": "{}"},
+        }],
+    }
+    eos_result = {
+        "role": "tool",
+        "tool_call_id": "call_eos",
+        "name": "end_of_step",
+        "content": '{"ok": true}',
+    }
+    history = [retained, observation, eos, eos_result]
+    agent = SimpleNamespace(
+        _flushed_db_message_ids={id(msg) for msg in history},
+        _last_flushed_db_idx=len(history),
+    )
+
+    cleaned = _sanitize_realshop_agent_history(agent, history)
+
+    assert cleaned == [retained]
+    assert cleaned[0] is retained
+    assert agent._flushed_db_message_ids == {id(retained)}
+    assert agent._last_flushed_db_idx == 1
 
 
 def test_run_does_not_send_observation_back_to_realshop_act(monkeypatch):

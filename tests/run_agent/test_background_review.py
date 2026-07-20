@@ -120,6 +120,202 @@ def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
     assert seen.get("at_run_time") is False
 
 
+def test_background_review_inherits_foreground_transport_policy(monkeypatch):
+    """The review fork must keep non-streaming and the parent's retry budget."""
+    seen = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+            self._disable_streaming = False
+            self._api_max_retries = 3
+
+        def run_conversation(self, **kwargs):
+            seen["disable_streaming"] = self._disable_streaming
+            seen["api_max_retries"] = self._api_max_retries
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    agent._disable_streaming = True
+    agent._api_max_retries = 6
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+        review_skills=True,
+    )
+
+    assert seen == {
+        "disable_streaming": True,
+        "api_max_retries": 6,
+    }
+
+
+def test_background_review_reports_successful_usage_before_fork_teardown(monkeypatch):
+    reported = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+            self.model = "primary-review-model"
+            self.provider = "primary-review-provider"
+            self.session_api_calls = 0
+
+        def run_conversation(self, **kwargs):
+            from decimal import Decimal
+            from agent.usage_pricing import (
+                CanonicalUsage,
+                CostResult,
+                emit_usage_event,
+            )
+
+            self.session_api_calls = 1
+            emit_usage_event(
+                self,
+                CanonicalUsage(
+                    input_tokens=700,
+                    output_tokens=40,
+                    cache_read_tokens=200,
+                    cache_write_tokens=25,
+                    reasoning_tokens=10,
+                ),
+                CostResult(
+                    amount_usd=Decimal("0.123"),
+                    status="estimated",
+                    source="official_docs_snapshot",
+                    label="~$0.12",
+                ),
+                total_tokens=975,
+            )
+            # A later fallback has a different billing route and no known
+            # price. It must remain a separate record instead of rewriting the
+            # first call's identity or making the whole session unpriced.
+            self.model = "fallback-review-model"
+            self.provider = "fallback-review-provider"
+            self.session_api_calls = 2
+            emit_usage_event(
+                self,
+                CanonicalUsage(input_tokens=300, output_tokens=20),
+                CostResult(
+                    amount_usd=None,
+                    status="unknown",
+                    source="none",
+                    label="n/a",
+                ),
+                total_tokens=320,
+            )
+            return {"final_response": "reviewed"}
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    from agent.background_review import spawn_background_review_thread
+
+    target, _ = spawn_background_review_thread(
+        agent,
+        [{"role": "user", "content": "hello"}],
+        review_memory=True,
+        usage_callback=lambda usage: reported.append(usage),
+    )
+    target()
+
+    assert reported == [{
+        "input": 700,
+        "output": 40,
+        "cache_read": 200,
+        "cache_write": 25,
+        "reasoning": 10,
+        "total": 975,
+        "model": "primary-review-model",
+        "provider": "primary-review-provider",
+        "request_index": 1,
+        "cost_status": "estimated",
+        "cost_source": "official_docs_snapshot",
+        "cost_usd": 0.123,
+    }, {
+        "input": 300,
+        "output": 20,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0,
+        "total": 320,
+        "model": "fallback-review-model",
+        "provider": "fallback-review-provider",
+        "request_index": 2,
+        "cost_status": "unknown",
+        "cost_source": "none",
+    }]
+
+
+def test_background_review_reports_billed_usage_before_terminal_error(monkeypatch):
+    reported = []
+
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+            self.model = "review-model"
+            self.provider = "review-provider"
+            self.session_api_calls = 0
+
+        def run_conversation(self, **kwargs):
+            from agent.usage_pricing import (
+                CanonicalUsage,
+                CostResult,
+                emit_usage_event,
+            )
+
+            self.session_api_calls = 1
+            emit_usage_event(
+                self,
+                CanonicalUsage(input_tokens=300, output_tokens=20),
+                CostResult(
+                    amount_usd=None,
+                    status="unknown",
+                    source="none",
+                    label="n/a",
+                ),
+                total_tokens=320,
+            )
+            raise RuntimeError("terminal review failure after one response")
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+    agent = _bare_agent()
+    from agent.background_review import spawn_background_review_thread
+
+    target, _ = spawn_background_review_thread(
+        agent,
+        [{"role": "user", "content": "hello"}],
+        review_memory=True,
+        usage_callback=reported.append,
+    )
+    target()
+
+    assert reported[0]["total"] == 320
+
+
 def test_background_review_summarizer_receives_captured_messages_after_close(monkeypatch):
     """The action summarizer must see review messages even after close cleanup.
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,6 +9,9 @@ from typing import Any, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
 from utils import base_url_host_matches
+
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
@@ -76,6 +80,40 @@ class CostResult:
     fetched_at: Optional[datetime] = None
     pricing_version: Optional[str] = None
     notes: tuple[str, ...] = ()
+
+
+def emit_usage_event(
+    agent: Any,
+    usage: CanonicalUsage,
+    cost: CostResult,
+    *,
+    total_tokens: Optional[int] = None,
+) -> None:
+    """Report one completed model response to an optional agent-local sink."""
+    callback = getattr(agent, "_usage_event_callback", None)
+    if not callable(callback):
+        return
+    event = {
+        "input": int(usage.input_tokens or 0),
+        "output": int(usage.output_tokens or 0),
+        "cache_read": int(usage.cache_read_tokens or 0),
+        "cache_write": int(usage.cache_write_tokens or 0),
+        "reasoning": int(usage.reasoning_tokens or 0),
+        "total": int(
+            usage.total_tokens if total_tokens is None else total_tokens
+        ),
+        "model": str(getattr(agent, "model", "") or ""),
+        "provider": str(getattr(agent, "provider", "") or ""),
+        "request_index": int(getattr(agent, "session_api_calls", 0) or 0),
+        "cost_status": str(cost.status or "unknown"),
+        "cost_source": str(cost.source or "none"),
+    }
+    if cost.amount_usd is not None:
+        event["cost_usd"] = float(cost.amount_usd)
+    try:
+        callback(event)
+    except Exception as exc:
+        logger.warning("Per-response usage callback failed: %s", exc)
 
 
 _UTC_NOW = lambda: datetime.now(timezone.utc)

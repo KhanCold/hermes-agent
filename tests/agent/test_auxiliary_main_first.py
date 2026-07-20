@@ -13,7 +13,69 @@ runs when the main provider has no working client.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+
+# ── Billing identity propagation ────────────────────────────────────────────
+
+
+def test_validated_auxiliary_response_retains_actual_billing_identity():
+    from agent.auxiliary_client import (
+        _validate_with_billing_identity,
+        get_auxiliary_billing_identity,
+    )
+
+    response = SimpleNamespace(
+        model="actual-model",
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+    )
+    client = SimpleNamespace(
+        base_url="https://provider.example/v1",
+        api_key="runtime-key",
+    )
+
+    validated = _validate_with_billing_identity(
+        response,
+        "compression",
+        provider="routed-provider",
+        model="requested-model",
+        client=client,
+    )
+
+    assert validated is response
+    assert get_auxiliary_billing_identity(response) == {
+        "provider": "routed-provider",
+        "model": "actual-model",
+        "base_url": "https://provider.example/v1",
+        "api_key": "runtime-key",
+    }
+
+
+def test_billing_identity_resolves_auto_provider_from_final_client():
+    from agent.auxiliary_client import (
+        _validate_with_billing_identity,
+        get_auxiliary_billing_identity,
+    )
+
+    response = SimpleNamespace(
+        model="anthropic/claude-opus-4.8",
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+    )
+    client = SimpleNamespace(
+        base_url="https://openrouter.ai/api/v1",
+        api_key="runtime-key",
+    )
+
+    _validate_with_billing_identity(
+        response,
+        "compression",
+        provider="auto",
+        model="requested-model",
+        client=client,
+    )
+
+    assert get_auxiliary_billing_identity(response)["provider"] == "openrouter"
 
 
 
@@ -307,6 +369,42 @@ class TestResolveAutoMainFirst:
         assert mock_resolve.call_args.kwargs["explicit_base_url"] == token_plan_url
         assert mock_resolve.call_args.kwargs["explicit_api_key"] == "tp-test-key"
         assert mock_resolve.call_args.kwargs["api_mode"] == "chat_completions"
+
+    def test_providerless_live_runtime_uses_custom_main_endpoint(self):
+        """Adapters may provide a complete live runtime without naming a provider."""
+        gateway_url = "https://idealab.alibaba-inc.com/api/openai/v1"
+        with patch(
+            "agent.auxiliary_client._read_main_provider", return_value="",
+        ), patch(
+            "agent.auxiliary_client._read_main_model", return_value="",
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client"
+        ) as mock_resolve:
+            mock_client = MagicMock()
+            mock_resolve.return_value = (mock_client, "bailian/glm-5.2")
+
+            from agent.auxiliary_client import _resolve_auto
+
+            client, model = _resolve_auto(
+                main_runtime={
+                    "provider": "",
+                    "model": "bailian/glm-5.2",
+                    "base_url": gateway_url,
+                    "api_key": "test-key",
+                    "api_mode": "chat_completions",
+                },
+                task="compression",
+            )
+
+        assert client is mock_client
+        assert model == "bailian/glm-5.2"
+        mock_resolve.assert_called_once_with(
+            "custom",
+            "bailian/glm-5.2",
+            explicit_base_url=gateway_url,
+            explicit_api_key="test-key",
+            api_mode="chat_completions",
+        )
 
 
 # ── Vision — resolve_vision_provider_client ─────────────────────────────────

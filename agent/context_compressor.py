@@ -21,10 +21,16 @@ import json
 import logging
 import sqlite3
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from agent.auxiliary_client import call_llm, _is_connection_error, aux_interrupt_protection
+from agent.auxiliary_client import (
+    call_llm,
+    _is_connection_error,
+    aux_interrupt_protection,
+    get_auxiliary_billing_identity,
+)
 from agent.context_engine import ContextEngine
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
@@ -163,6 +169,11 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+_SUMMARY_MAX_ATTEMPTS = 3
+
+
+def _sleep_before_summary_retry(delay: float) -> None:
+    time.sleep(delay)
 
 # Hard ceiling for the deterministic summary-failure handoff.  The fallback is
 # only meant to preserve continuity anchors from the dropped window, not to
@@ -1006,6 +1017,118 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+        # Summary requests run through the auxiliary client, so their usage is
+        # not part of the foreground agent's session_* counters.  Keep a
+        # monotonic process-local total that adapters can report to their
+        # surrounding harness exactly once.
+        self._summary_usage_lock = threading.Lock()
+        self._summary_usage_totals = {
+            "input": 0,
+            "output": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "reasoning": 0,
+            "total": 0,
+        }
+        self._summary_usage_records: List[Dict[str, Any]] = []
+
+    def summary_usage_snapshot(self) -> Dict[str, int]:
+        """Return cumulative token usage from completed summary responses."""
+        with self._summary_usage_lock:
+            return dict(self._summary_usage_totals)
+
+    def summary_usage_records_snapshot(self) -> List[Dict[str, Any]]:
+        """Return per-response summary usage with billing identity metadata."""
+        with self._summary_usage_lock:
+            return [dict(record) for record in self._summary_usage_records]
+
+    def _record_summary_response_usage(self, response: Any) -> None:
+        """Accumulate usage from one returned auxiliary summary response.
+
+        Record before validating the summary body: a provider can charge for
+        an HTTP-200 response whose content is empty or otherwise unusable.
+        Transport failures without a returned usage object cannot be measured.
+        """
+        usage = (
+            response.get("usage")
+            if isinstance(response, dict)
+            else getattr(response, "usage", None)
+        )
+        if not usage:
+            return
+        try:
+            from agent.usage_pricing import estimate_usage_cost, normalize_usage
+
+            # call_llm() deliberately exposes an OpenAI-compatible response
+            # for every auxiliary transport.  Its Anthropic and Codex wrappers
+            # have already translated native input_tokens/output_tokens into
+            # prompt_tokens/completion_tokens, so parsing this with the main
+            # agent's native api_mode would incorrectly turn those buckets into
+            # zeros.
+            normalized = normalize_usage(
+                usage,
+                provider="",
+                api_mode="chat_completions",
+            )
+            delta = {
+                "input": int(normalized.input_tokens or 0),
+                "output": int(normalized.output_tokens or 0),
+                "cache_read": int(normalized.cache_read_tokens or 0),
+                "cache_write": int(normalized.cache_write_tokens or 0),
+                "reasoning": int(normalized.reasoning_tokens or 0),
+                "total": int(normalized.total_tokens or 0),
+            }
+            billing_identity = get_auxiliary_billing_identity(response)
+            actual_model = str(
+                billing_identity.get("model")
+                or getattr(response, "model", None)
+                or self.summary_model
+                or self.model
+                or ""
+            )
+            same_as_main = actual_model == str(self.model or "")
+            actual_provider = str(
+                billing_identity.get("provider")
+                or (self.provider if same_as_main else "")
+                or ""
+            )
+            actual_base_url = str(
+                billing_identity.get("base_url")
+                or (self.base_url if same_as_main else "")
+                or ""
+            )
+            billing_api_key = str(
+                billing_identity.get("api_key")
+                or (self.api_key if same_as_main else "")
+                or ""
+            )
+            cost_result = estimate_usage_cost(
+                actual_model,
+                normalized,
+                provider=actual_provider or None,
+                base_url=actual_base_url or None,
+                api_key=billing_api_key or None,
+            )
+            record = {
+                "token_usage": dict(delta),
+                "model": actual_model,
+                "provider": actual_provider,
+                "cost_status": str(cost_result.status or "unknown"),
+                "cost_source": str(cost_result.source or "none"),
+                "cost_usd": (
+                    None
+                    if cost_result.amount_usd is None
+                    else float(cost_result.amount_usd)
+                ),
+            }
+        except Exception as exc:
+            logger.debug("Could not normalize context-summary usage: %s", exc)
+            return
+
+        with self._summary_usage_lock:
+            for key, value in delta.items():
+                self._summary_usage_totals[key] += max(0, value)
+            self._summary_usage_records.append(record)
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -1778,41 +1901,59 @@ This compaction should PRIORITISE preserving all information related to the focu
             }
             if self.summary_model:
                 call_kwargs["model"] = self.summary_model
-            # Compression is atomic: protect the in-flight summary call from a
-            # mid-turn gateway interrupt. Without this, an incoming user message
-            # aborts the summary and compression falls back to a degraded static
-            # marker, losing the real handoff (#23975). Re-entrant: a main-model
-            # retry (_generate_summary recursion) re-enters harmlessly.
-            with aux_interrupt_protection():
-                response = call_llm(**call_kwargs)
-            # ``_validate_llm_response`` only guarantees ``choices[0].message``
-            # exists, not that it's an object with ``.content``. Some
-            # OpenAI-compatible proxies / local backends return a dict- or
-            # str-shaped message; coerce defensively instead of crashing.
-            message = response.choices[0].message
-            if isinstance(message, dict):
-                content = message.get("content")
-            else:
-                content = getattr(message, "content", message)
-            # Handle cases where content is not a string (e.g., dict from llama.cpp)
-            if not isinstance(content, str):
-                content = str(content) if content else ""
-            # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels)
-            # return a well-formed HTTP 200 with an empty or whitespace-only
-            # ``content`` instead of an error or empty ``choices``. That payload
-            # passes ``_validate_llm_response`` (a ``message`` exists), so it
-            # reaches here and would otherwise be stored as a prefix-only
-            # summary with no body — silently wiping the compacted turns and
-            # making the model forget the in-progress task (#11978, #11914).
-            # Treat empty content as a failure so it routes through the same
-            # main-model fallback + cooldown machinery as a transport error,
-            # rather than replacing real context with an empty summary.
-            if not content.strip():
-                raise RuntimeError(
-                    "Context compression LLM returned empty content "
-                    f"(provider={self.provider or 'auto'} "
-                    f"model={self.summary_model or self.model})"
-                )
+            for attempt in range(_SUMMARY_MAX_ATTEMPTS):
+                try:
+                    # Compression is atomic: protect each in-flight summary
+                    # call from a mid-turn gateway interrupt.  Backoff remains
+                    # outside the protection window.
+                    with aux_interrupt_protection():
+                        response = call_llm(**call_kwargs)
+                    self._record_summary_response_usage(response)
+                    # ``_validate_llm_response`` only guarantees
+                    # ``choices[0].message`` exists, not that it's an object
+                    # with ``.content``. Some OpenAI-compatible proxies / local
+                    # backends return a dict- or str-shaped message.
+                    message = response.choices[0].message
+                    if isinstance(message, dict):
+                        content = message.get("content")
+                    else:
+                        content = getattr(message, "content", message)
+                    if not isinstance(content, str):
+                        content = str(content) if content else ""
+                    # An HTTP-200 empty summary is still a failed attempt. Its
+                    # usage was recorded above before the retry.
+                    if not content.strip():
+                        raise RuntimeError(
+                            "Context compression LLM returned empty content "
+                            f"(provider={self.provider or 'auto'} "
+                            f"model={self.summary_model or self.model})"
+                        )
+                    break
+                except Exception as retry_error:
+                    # A separately configured summary model already has the
+                    # existing immediate fallback-to-main path below. Treat
+                    # that fallback as the next attempt instead of hammering a
+                    # known-bad auxiliary model three times. RealShop uses the
+                    # main model directly, so its summary path always receives
+                    # the full three-attempt budget here.
+                    if (
+                        self.summary_model
+                        and self.summary_model != self.model
+                        and not getattr(self, "_summary_model_fallen_back", False)
+                    ):
+                        raise
+                    if attempt + 1 >= _SUMMARY_MAX_ATTEMPTS:
+                        raise
+                    delay = 2 ** attempt
+                    logger.warning(
+                        "Context summary attempt %d/%d failed: %s; "
+                        "retrying in %ds",
+                        attempt + 1,
+                        _SUMMARY_MAX_ATTEMPTS,
+                        retry_error,
+                        delay,
+                    )
+                    _sleep_before_summary_retry(delay)
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = redact_sensitive_text(content.strip())

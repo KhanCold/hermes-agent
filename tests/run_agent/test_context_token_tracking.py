@@ -111,8 +111,39 @@ def test_openai_prompt_tokens_unchanged(monkeypatch):
         model="gpt-4o",
     )
     agent = _make_agent(monkeypatch, "chat_completions", "openrouter", resp)
+    usage_events = []
+    agent._usage_event_callback = usage_events.append
     agent.run_conversation("hi")
     assert agent.context_compressor.last_prompt_tokens == 5000
+    assert len(usage_events) == 1
+    assert usage_events[0]["cost_status"] in {
+        "actual", "estimated", "included", "unknown"
+    }
+    assert isinstance(usage_events[0]["cost_source"], str)
+    assert {
+        key: usage_events[0][key]
+        for key in (
+            "input",
+            "output",
+            "cache_read",
+            "cache_write",
+            "reasoning",
+            "total",
+            "model",
+            "provider",
+            "request_index",
+        )
+    } == {
+        "input": 5000,
+        "output": 100,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0,
+        "total": 5100,
+        "model": "test-model",
+        "provider": "openrouter",
+        "request_index": 1,
+    }
 
 
 # -- Codex: no cache fields, getattr returns 0 --

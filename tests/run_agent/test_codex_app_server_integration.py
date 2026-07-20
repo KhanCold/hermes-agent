@@ -106,6 +106,8 @@ class TestRunConversationCodexPath:
             CodexAppServerSession, "ensure_started", lambda self: "thread-usage-1"
         )
         agent = _make_codex_agent()
+        usage_events = []
+        agent._usage_event_callback = usage_events.append
         with patch.object(agent, "_spawn_background_review", return_value=None):
             result = agent.run_conversation("hello")
 
@@ -123,6 +125,24 @@ class TestRunConversationCodexPath:
         assert agent.session_api_calls == 1
         assert agent.session_prompt_tokens == 100
         assert agent.session_completion_tokens == 25
+        assert usage_events == [{
+            "input": 80,
+            "output": 25,
+            "cache_read": 20,
+            "cache_write": 0,
+            "reasoning": 5,
+            "total": 130,
+            "model": agent.model,
+            "provider": agent.provider,
+            "request_index": 1,
+            "cost_status": agent.session_cost_status,
+            "cost_source": agent.session_cost_source,
+            **(
+                {"cost_usd": agent.session_estimated_cost_usd}
+                if agent.session_cost_status != "unknown"
+                else {}
+            ),
+        }]
         assert agent.session_total_tokens == 130
         assert agent.session_input_tokens == 80
         assert agent.session_output_tokens == 25
@@ -588,4 +608,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-

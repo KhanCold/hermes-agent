@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
 
@@ -573,6 +573,7 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -660,6 +661,25 @@ def _run_review_in_thread(
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
             )
+            # The review fork sends requests to the same endpoint as the
+            # foreground agent, so it must inherit the foreground transport
+            # policy too.  In particular, adapters may disable streaming to
+            # make partial-delivery failures safely retryable and raise the
+            # retry budget above AIAgent's default.  Reverting to the generic
+            # defaults here made combined reviews stream and stop after only
+            # three attempts even when the foreground used non-streaming with
+            # six exponential-backoff attempts.
+            if hasattr(agent, "_disable_streaming"):
+                review_agent._disable_streaming = bool(agent._disable_streaming)
+            if hasattr(agent, "_api_max_retries"):
+                review_agent._api_max_retries = int(agent._api_max_retries)
+            # Each successful provider response reports its own route, usage,
+            # and price.  Session counters deliberately cannot serve this
+            # purpose: a fallback can change model/provider midway through a
+            # multi-call review, and the session's status/source fields only
+            # describe the last response.
+            if usage_callback is not None:
+                review_agent._usage_event_callback = usage_callback
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
             # The review fork pins the parent's cached system prompt and keeps
@@ -860,6 +880,7 @@ def spawn_background_review_thread(
     messages_snapshot: List[Dict],
     review_memory: bool = False,
     review_skills: bool = False,
+    usage_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ):
     """Build the review thread target and prompt for a background review.
 
@@ -878,7 +899,12 @@ def spawn_background_review_thread(
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(
+            agent,
+            messages_snapshot,
+            prompt,
+            usage_callback=usage_callback,
+        )
 
     return _target, prompt
 

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import sys
 import threading
 import time
+import uuid
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -20,7 +22,7 @@ from . import __version__
 
 FRAMEWORK = "hermes"
 DEFAULT_MAX_HOPS_PER_STEP = 30
-REALSHOP_REVIEW_INTERVAL_USER_TURNS = 10
+REALSHOP_REVIEW_INTERVAL_USER_TURNS = 100
 REALSHOP_TOOL_PREFIX = "realshop__"
 REALSHOP_TOOL_ORIGIN = "realshop_env"
 HERMES_TOOL_ORIGIN = "hermes_native"
@@ -394,6 +396,192 @@ def _usage_delta(before: dict[str, int], agent: Any) -> Optional[dict[str, int]]
     return delta if any(delta.values()) else None
 
 
+_TOKEN_USAGE_KEYS = (
+    "input",
+    "output",
+    "cache_read",
+    "cache_write",
+    "reasoning",
+    "total",
+)
+
+
+def _canonical_token_usage(
+    usage: Optional[dict[str, int]],
+) -> Optional[dict[str, int]]:
+    if not usage:
+        return None
+    normalized = {
+        key: max(0, int(usage.get(key, 0) or 0))
+        for key in _TOKEN_USAGE_KEYS
+    }
+    if "total" not in usage:
+        normalized["total"] = sum(
+            normalized[key]
+            for key in ("input", "output", "cache_read", "cache_write")
+        )
+    return normalized if any(normalized.values()) else None
+
+
+def _summary_usage_snapshot(agent: Any) -> dict[str, int]:
+    compressor = getattr(agent, "context_compressor", None)
+    snapshotter = getattr(compressor, "summary_usage_snapshot", None)
+    if not callable(snapshotter):
+        return {key: 0 for key in _TOKEN_USAGE_KEYS}
+    try:
+        snapshot = snapshotter() or {}
+        return {
+            key: max(0, int(snapshot.get(key, 0) or 0))
+            for key in _TOKEN_USAGE_KEYS
+        }
+    except (AttributeError, TypeError, ValueError):
+        return {key: 0 for key in _TOKEN_USAGE_KEYS}
+
+
+def _summary_usage_records_snapshot(agent: Any) -> list[dict[str, Any]]:
+    compressor = getattr(agent, "context_compressor", None)
+    snapshotter = getattr(compressor, "summary_usage_records_snapshot", None)
+    if not callable(snapshotter):
+        return []
+    try:
+        return [dict(record) for record in (snapshotter() or [])]
+    except (AttributeError, TypeError, ValueError):
+        return []
+
+
+def _realshop_token_usage(
+    agent: Any,
+    foreground_usage: Optional[dict[str, int]],
+) -> Optional[dict[str, int]]:
+    """Return foreground-only usage; auxiliary work has its own ledger."""
+    return _canonical_token_usage(foreground_usage)
+
+
+def _post_auxiliary_usage(
+    client: RealShopToolClient,
+    batch: dict[str, Any],
+    *,
+    attempts: int,
+) -> bool:
+    last_error: Optional[Exception] = None
+    for attempt in range(max(1, attempts)):
+        try:
+            client.record_usage(
+                batch["token_usage"],
+                usage_id=batch["usage_id"],
+                source=batch["source"],
+                step=batch.get("step"),
+                model=batch.get("model"),
+                provider=batch.get("provider"),
+                cost_usd=batch.get("cost_usd"),
+                cost_status=batch.get("cost_status"),
+                cost_source=batch.get("cost_source"),
+            )
+            return True
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < max(1, attempts):
+                time.sleep(2 ** attempt)
+    if last_error is not None:
+        log.warning(
+            "Could not record auxiliary usage %s: %s",
+            batch.get("usage_id"),
+            last_error,
+        )
+    return False
+
+
+def _flush_pending_summary_usage(
+    agent: Any,
+    client: RealShopToolClient,
+    *,
+    attempts: int,
+) -> None:
+    records = _summary_usage_records_snapshot(agent)
+    reported = int(
+        getattr(agent, "_realshop_reported_summary_record_count", 0) or 0
+    )
+    reported_steps = getattr(agent, "_realshop_summary_usage_steps", None)
+    if not isinstance(reported_steps, dict):
+        reported_steps = {}
+        agent._realshop_summary_usage_steps = reported_steps
+    usage_session_id = str(
+        getattr(agent, "_realshop_usage_session_id", "") or ""
+    )
+    if not usage_session_id:
+        usage_session_id = uuid.uuid4().hex
+        agent._realshop_usage_session_id = usage_session_id
+    while reported < len(records):
+        record = records[reported]
+        usage = _canonical_token_usage(record.get("token_usage"))
+        if usage is None:
+            reported += 1
+            agent._realshop_reported_summary_record_count = reported
+            continue
+        usage_step = reported_steps.setdefault(
+            reported,
+            client.latest_env_t(),
+        )
+        digest = hashlib.sha256(
+            json.dumps(
+                {
+                    "session": usage_session_id,
+                    "index": reported,
+                    "step": usage_step,
+                    "record": record,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        batch = {
+            **record,
+            "usage_id": f"compression-{reported}-{digest}",
+            "source": "context_compression",
+            "token_usage": usage,
+            "step": usage_step,
+        }
+        if not _post_auxiliary_usage(client, batch, attempts=attempts):
+            return
+        reported += 1
+        agent._realshop_reported_summary_record_count = reported
+        reported_steps.pop(reported - 1, None)
+
+
+def _flush_pending_review_usage(
+    agent: Any,
+    client: RealShopToolClient,
+    *,
+    attempts: int,
+) -> None:
+    lock = getattr(agent, "_realshop_review_usage_lock", None)
+    if lock is None:
+        return
+    with lock:
+        batches = [dict(batch) for batch in agent._realshop_review_usage_batches]
+    for batch in batches:
+        if not _post_auxiliary_usage(client, batch, attempts=attempts):
+            return
+        with lock:
+            agent._realshop_review_usage_batches = [
+                queued
+                for queued in agent._realshop_review_usage_batches
+                if queued.get("usage_id") != batch.get("usage_id")
+            ]
+
+
+def _flush_pending_auxiliary_usage(
+    agent: Any,
+    client: RealShopToolClient,
+    *,
+    attempts: int = 3,
+) -> None:
+    """Persist all unreported auxiliary usage through idempotent entries."""
+    _flush_pending_summary_usage(agent, client, attempts=attempts)
+    _flush_pending_review_usage(agent, client, attempts=attempts)
+
+
 def _message_signature(message: dict[str, Any]) -> str:
     return json.dumps(message, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
 
@@ -453,6 +641,121 @@ def _new_trace_messages(
         if trace_msg is not None:
             out.append(trace_msg)
     return out
+
+
+def _sanitize_realshop_history(
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove RealShop hook-control messages from the next LLM prompt.
+
+    ``end_of_step`` is a transport-level acknowledgement that must remain in
+    the RealShop trace, but repeatedly replaying it to the model can trigger
+    provider loop detection.  Also discard orphaned tool results left behind
+    by compaction so the retained OpenAI message sequence stays valid.
+    """
+    eos_call_ids: set[str] = set()
+    sanitized: list[dict[str, Any]] = []
+
+    for raw in history:
+        if not isinstance(raw, dict):
+            continue
+        msg = raw
+        if msg.get("role") != "assistant":
+            sanitized.append(msg)
+            continue
+
+        tool_calls = msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            sanitized.append(msg)
+            continue
+
+        kept_calls: list[dict[str, Any]] = []
+        removed_eos = False
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function") or {}
+            if _realshop_env_tool_name(fn.get("name")) == "end_of_step":
+                removed_eos = True
+                call_id = call.get("id")
+                if call_id:
+                    eos_call_ids.add(str(call_id))
+                continue
+            kept_calls.append(call)
+
+        if not removed_eos:
+            sanitized.append(msg)
+            continue
+        msg = dict(raw)
+        if kept_calls:
+            msg["tool_calls"] = kept_calls
+            sanitized.append(msg)
+            continue
+
+        msg.pop("tool_calls", None)
+        msg.pop("tool_origin", None)
+        content = msg.get("content")
+        drop_with_observation = False
+        if isinstance(content, str):
+            for marker in ("\n\n[fallback]", "\n\n[llm-error]"):
+                marker_idx = content.find(marker)
+                if marker_idx >= 0:
+                    content = content[:marker_idx].rstrip()
+            if content.startswith(("[fallback]", "[llm-error]")):
+                content = ""
+            msg["content"] = content
+        if not content and not msg.get("reasoning_content"):
+            # A synthetic/empty acknowledgement contains no model decision.
+            # Drop its observation too so the next full observation does not
+            # create adjacent user roles.
+            drop_with_observation = True
+            msg["_realshop_drop_with_observation"] = True
+        if content or msg.get("reasoning_content"):
+            sanitized.append(msg)
+        elif drop_with_observation:
+            sanitized.append(msg)
+
+    valid_tool_call_ids = {
+        str(call.get("id"))
+        for msg in sanitized
+        if msg.get("role") == "assistant"
+        for call in (msg.get("tool_calls") or [])
+        if isinstance(call, dict) and call.get("id")
+    }
+    filtered = [
+        msg
+        for msg in sanitized
+        if msg.get("role") != "tool"
+        or (
+            str(msg.get("tool_call_id") or "") not in eos_call_ids
+            and str(msg.get("tool_call_id") or "") in valid_tool_call_ids
+        )
+    ]
+    repaired: list[dict[str, Any]] = []
+    for msg in filtered:
+        if msg.pop("_realshop_drop_with_observation", False):
+            if repaired and repaired[-1].get("role") == "user":
+                repaired.pop()
+            continue
+        repaired.append(msg)
+    return repaired
+
+
+def _sanitize_realshop_agent_history(
+    agent: Any,
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Sanitize provider history and reconcile SessionDB identity tracking."""
+    sanitized = _sanitize_realshop_history(history)
+    flushed_ids = getattr(agent, "_flushed_db_message_ids", None)
+    if isinstance(flushed_ids, set):
+        flushed_ids.intersection_update(
+            id(msg) for msg in sanitized if isinstance(msg, dict)
+        )
+    flush_cursor = getattr(agent, "_last_flushed_db_idx", None)
+    if isinstance(flush_cursor, int):
+        agent._last_flushed_db_idx = min(flush_cursor, len(sanitized))
+    return sanitized
 
 
 def _reorder_end_of_step_last(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -537,7 +840,62 @@ class RealShopHermesAgent(AIAgent):
         self._realshop_last_act: Optional[dict[str, Any]] = None
         self._realshop_trace_msgs_for_act: list[dict[str, Any]] = []
         self._realshop_reported_compression_count = _compressor_count(self)
+        self._realshop_reported_summary_record_count = len(
+            _summary_usage_records_snapshot(self)
+        )
+        # Stable for this adapter process so retries reuse an idempotency key,
+        # but distinct after a process restart so a resumed run cannot collide
+        # with an earlier compression record that had the same index/payload.
+        self._realshop_usage_session_id = uuid.uuid4().hex
+        self._realshop_summary_usage_steps: dict[int, Optional[int]] = {}
+        self._realshop_review_usage_lock = threading.Lock()
+        self._realshop_review_usage_batches: list[dict[str, Any]] = []
         self.refresh_realshop_tools()
+
+    def _record_background_review_usage(self, usage: dict[str, Any]) -> None:
+        normalized = _canonical_token_usage(usage)
+        if normalized is None:
+            return
+        trigger_step = self.realshop_client.latest_env_t()
+        identity = {
+            "turn": int(getattr(self, "_user_turn_count", 0) or 0),
+            "request_index": int(usage.get("request_index", 0) or 0),
+            "step": trigger_step,
+            "usage": normalized,
+            "model": str(usage.get("model") or ""),
+            "provider": str(usage.get("provider") or ""),
+            "cost_usd": usage.get("cost_usd"),
+            "cost_status": str(usage.get("cost_status") or "unknown"),
+            "cost_source": str(usage.get("cost_source") or "none"),
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        batch = {
+            "usage_id": (
+                f"checkpoint-review-turn-{identity['turn']}-"
+                f"call-{identity['request_index']}-{digest}"
+            ),
+            "source": "checkpoint_review",
+            "token_usage": normalized,
+            "step": trigger_step,
+            "model": identity["model"],
+            "provider": identity["provider"],
+            "cost_usd": identity["cost_usd"],
+            "cost_status": identity["cost_status"],
+            "cost_source": identity["cost_source"],
+        }
+        with self._realshop_review_usage_lock:
+            if not any(
+                queued.get("usage_id") == batch["usage_id"]
+                for queued in self._realshop_review_usage_batches
+            ):
+                self._realshop_review_usage_batches.append(batch)
 
     def _spawn_background_review(
         self,
@@ -561,6 +919,7 @@ class RealShopHermesAgent(AIAgent):
             messages_snapshot,
             review_memory=True,
             review_skills=True,
+            usage_callback=self._record_background_review_usage,
         )
         review_thread = threading.Thread(
             target=propagate_context_to_thread(target),
@@ -569,6 +928,11 @@ class RealShopHermesAgent(AIAgent):
         )
         review_thread.start()
         review_thread.join()
+        _flush_pending_review_usage(
+            self,
+            self.realshop_client,
+            attempts=3,
+        )
 
     def refresh_realshop_tools(self) -> None:
         realshop_tools = [
@@ -624,6 +988,14 @@ class RealShopHermesAgent(AIAgent):
         effective_task_id: str,
         api_call_count: int = 0,
     ) -> None:
+        # Compression/review calls are independent billable requests. Flush
+        # them through the idempotent cost endpoint before recording this
+        # foreground turn so a lost /act response can never duplicate them.
+        _flush_pending_auxiliary_usage(
+            self,
+            self.realshop_client,
+            attempts=1,
+        )
         raw_tool_calls = getattr(assistant_message, "tool_calls", None) or []
         realshop_tool_names = getattr(self, "_realshop_tool_names", set())
         tool_calls = _reorder_end_of_step_last([
@@ -704,10 +1076,13 @@ class RealShopHermesAgent(AIAgent):
             try:
                 native_token_usage = None
                 if not realshop_tool_calls:
-                    native_token_usage = _token_usage(
-                        assistant_message,
-                        provider=getattr(self, "provider", None),
-                        api_mode=getattr(self, "api_mode", None),
+                    native_token_usage = _realshop_token_usage(
+                        self,
+                        _token_usage(
+                            assistant_message,
+                            provider=getattr(self, "provider", None),
+                            api_mode=getattr(self, "api_mode", None),
+                        ),
                     )
                 native_context = _realshop_context(self, assistant_message)
                 self.realshop_client.act(
@@ -740,10 +1115,13 @@ class RealShopHermesAgent(AIAgent):
         try:
             context = _realshop_context(self, assistant_message)
             act_resp = self.realshop_client.act(
-                token_usage=_token_usage(
-                    assistant_message,
-                    provider=getattr(self, "provider", None),
-                    api_mode=getattr(self, "api_mode", None),
+                token_usage=_realshop_token_usage(
+                    self,
+                    _token_usage(
+                        assistant_message,
+                        provider=getattr(self, "provider", None),
+                        api_mode=getattr(self, "api_mode", None),
+                    ),
                 ),
                 messages=[*trace_msgs, realshop_assistant_msg],
                 context=context,
@@ -877,6 +1255,7 @@ def run(args: argparse.Namespace) -> int:
         except requests.HTTPError as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if status == 410:
+                _flush_pending_auxiliary_usage(agent, client)
                 if not args.quiet:
                     print("[realshop-adapter] run finished", file=sys.stderr)
                 return 0
@@ -886,6 +1265,7 @@ def run(args: argparse.Namespace) -> int:
             continue
 
         if args.max_steps is not None and _tick_step(obs) >= int(args.max_steps):
+            _flush_pending_auxiliary_usage(agent, client)
             if not args.quiet:
                 print(f"[realshop-adapter] reached max_steps={args.max_steps}", file=sys.stderr)
             return 0
@@ -898,6 +1278,7 @@ def run(args: argparse.Namespace) -> int:
             )
 
         observation_msg = {"role": "user", "content": obs.get("text", "") or ""}
+        history = _sanitize_realshop_agent_history(agent, history)
         history_len_before_step = len(history)
         agent._realshop_step_done = False
         agent._realshop_last_act = None
@@ -935,6 +1316,11 @@ def run(args: argparse.Namespace) -> int:
                 ]
                 no_tool_token_usage = _usage_delta(usage_before_step, agent)
             fallback_context = _realshop_context(agent)
+            _flush_pending_auxiliary_usage(
+                agent,
+                client,
+                attempts=3,
+            )
             history = _force_end_of_step(
                 client,
                 history,
@@ -946,8 +1332,14 @@ def run(args: argparse.Namespace) -> int:
             _mark_realshop_context_reported(agent)
             agent._realshop_trace_msgs_for_act = []
 
+        # RealShop's hook acknowledgement belongs in the environment trace,
+        # not in the next provider request.  Sanitize only after the current
+        # hook has been fully recorded.
+        history = _sanitize_realshop_agent_history(agent, history)
+
         step_count += 1
         if args.max_observations is not None and step_count >= int(args.max_observations):
+            _flush_pending_auxiliary_usage(agent, client)
             return 0
 
 

@@ -1376,14 +1376,19 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
             # breaking replay. Storage-time redaction remains governed by the
             # `security.redact_secrets` toggle. (#19798 introduced this;
             # #43083 removed it.)
-            # Preserve extra_content (e.g. Gemini thought_signature) so it
-            # is sent back on subsequent API calls.  Without this, Gemini 3
-            # thinking models reject the request with a 400 error.
+            # Preserve both Gemini thought-signature wire shapes so the
+            # transport can send the endpoint-specific shape on the next call.
             extra = getattr(tool_call, "extra_content", None)
             if extra is not None:
                 if hasattr(extra, "model_dump"):
                     extra = extra.model_dump()
                 tc_dict["extra_content"] = extra
+            direct_signature = getattr(tool_call, "thoughtSignature", None)
+            model_extra = getattr(tool_call, "model_extra", None)
+            if direct_signature is None and isinstance(model_extra, dict):
+                direct_signature = model_extra.get("thoughtSignature")
+            if isinstance(direct_signature, str) and direct_signature:
+                tc_dict["thoughtSignature"] = direct_signature
             tool_calls.append(tc_dict)
         msg["tool_calls"] = tool_calls
 
@@ -1773,6 +1778,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         # Same safety net as the main loop: drop thinking-only assistant
         # turns so Anthropic-family providers don't 400 the summary call.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
+
+        # This path calls chat.completions.create() directly instead of using
+        # build_api_kwargs(). Apply the transport's destination-aware Gemini
+        # signature conversion so Idealab receives ``thoughtSignature`` while
+        # Google's OpenAI-compatible endpoint receives ``extra_content``.
+        if agent.api_mode == "chat_completions":
+            api_messages = agent._get_transport().convert_messages(
+                api_messages,
+                model=agent.model,
+                base_url=agent.base_url,
+            )
 
         summary_extra_body = {}
         try:
@@ -2440,6 +2456,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             "type": "function",
                             "function": {"name": "", "arguments": ""},
                             "extra_content": None,
+                            "thoughtSignature": None,
                         }
                     entry = tool_calls_acc[idx]
                     if tc_delta.id:
@@ -2464,6 +2481,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         if hasattr(extra, "model_dump"):
                             extra = extra.model_dump()
                         entry["extra_content"] = extra
+                    direct_signature = getattr(tc_delta, "thoughtSignature", None)
+                    model_extra = getattr(tc_delta, "model_extra", None)
+                    if direct_signature is None and isinstance(model_extra, dict):
+                        direct_signature = model_extra.get("thoughtSignature")
+                    if isinstance(direct_signature, str) and direct_signature:
+                        entry["thoughtSignature"] = direct_signature
                     # Fire once per tool when the full name is available
                     name = entry["function"]["name"]
                     if name and idx not in tool_gen_notified:
@@ -2518,6 +2541,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     id=tc["id"],
                     type=tc["type"],
                     extra_content=tc.get("extra_content"),
+                    thoughtSignature=tc.get("thoughtSignature"),
                     function=SimpleNamespace(
                         name=tc["function"]["name"],
                         arguments=arguments,

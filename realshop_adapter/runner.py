@@ -173,6 +173,14 @@ def _openai_tool_call(
         if hasattr(extra_content, "model_dump"):
             extra_content = extra_content.model_dump()
         out["extra_content"] = extra_content
+    direct_signature = getattr(tool_call, "thoughtSignature", None)
+    model_extra = getattr(tool_call, "model_extra", None)
+    if direct_signature is None and isinstance(tool_call, dict):
+        direct_signature = tool_call.get("thoughtSignature")
+    if direct_signature is None and isinstance(model_extra, dict):
+        direct_signature = model_extra.get("thoughtSignature")
+    if isinstance(direct_signature, str) and direct_signature:
+        out["thoughtSignature"] = direct_signature
     return out
 
 

@@ -913,6 +913,44 @@ def test_realshop_tool_call_preserves_gemini_thought_signature():
     assert sent_tool_call["extra_content"] == signature
 
 
+def test_realshop_tool_call_preserves_direct_gemini_thought_signature():
+    client = FakeRealShopClient()
+    agent = RealShopHermesAgent.__new__(RealShopHermesAgent)
+    agent.realshop_client = client
+    agent.provider = ""
+    agent.api_mode = "chat_completions"
+    agent._realshop_step_done = False
+    agent._realshop_last_act = None
+    agent._realshop_trace_msgs_for_act = []
+    agent._native_tools = []
+    agent.tools = []
+    agent.valid_tool_names = set()
+
+    assistant_message = SimpleNamespace(
+        content=None,
+        usage=None,
+        tool_calls=[
+            SimpleNamespace(
+                id="call_env_direct",
+                model_extra={"thoughtSignature": "sig-direct-123"},
+                function=SimpleNamespace(
+                    name="realshop__search_products",
+                    arguments='{"query":"toy"}',
+                ),
+            )
+        ],
+    )
+    persisted_assistant = {"role": "assistant", "content": None}
+    messages = [persisted_assistant]
+
+    agent._execute_tool_calls(assistant_message, messages, "task-1", 1)
+
+    persisted_tool_call = persisted_assistant["tool_calls"][0]
+    assert persisted_tool_call["thoughtSignature"] == "sig-direct-123"
+    sent_tool_call = client.act_calls[0]["messages"][-1]["tool_calls"][0]
+    assert sent_tool_call["thoughtSignature"] == "sig-direct-123"
+
+
 def test_realshop_end_of_step_flushes_tool_results_to_session_db():
     class StepDoneClient(FakeRealShopClient):
         def act(self, assistant_message=None, token_usage=None, *, messages=None, context=None):

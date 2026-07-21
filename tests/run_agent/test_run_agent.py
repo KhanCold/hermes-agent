@@ -2016,6 +2016,18 @@ class TestBuildAssistantMessage:
             "google": {"thought_signature": "abc123"}
         }
 
+    def test_tool_call_direct_thought_signature_preserved(self, agent):
+        """Native Gemini compatibility gateways put thoughtSignature directly
+        on the tool call; the exact field must survive history persistence.
+        """
+        tc = _mock_tool_call(
+            name="get_weather", arguments='{"city":"NYC"}', call_id="c-direct"
+        )
+        tc.model_extra = {"thoughtSignature": "sig-direct-123"}
+        msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        result = agent._build_assistant_message(msg, "tool_calls")
+        assert result["tool_calls"][0]["thoughtSignature"] == "sig-direct-123"
+
     def test_tool_call_without_extra_content(self, agent):
         """Standard tool calls (no thinking model) should not have extra_content."""
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c3")

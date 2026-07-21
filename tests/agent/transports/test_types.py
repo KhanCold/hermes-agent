@@ -228,6 +228,15 @@ class TestToolCallBackwardCompat:
         tc_no_extra = ToolCall(id="1", name="fn", arguments="{}")
         assert getattr(tc_no_extra, "extra_content", None) is None
 
+    def test_direct_thought_signature_from_provider_data(self):
+        tc = ToolCall(
+            id="1",
+            name="fn",
+            arguments="{}",
+            provider_data={"thoughtSignature": "SIG_DIRECT"},
+        )
+        assert getattr(tc, "thoughtSignature", None) == "SIG_DIRECT"
+
 
 class TestNormalizedResponseBackwardCompat:
     """Test properties that replaced _nr_to_assistant_message() shim."""

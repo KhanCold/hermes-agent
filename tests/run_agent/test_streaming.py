@@ -327,6 +327,47 @@ class TestStreamingAccumulator:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_tool_call_direct_thought_signature_preserved(self, mock_close, mock_create):
+        """Streamed Idealab tool calls preserve native thoughtSignature."""
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(
+                    index=0,
+                    tc_id="call_gemini",
+                    name="cronjob",
+                    model_extra={"thoughtSignature": "sig-direct-123"},
+                )
+            ]),
+            _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(index=0, arguments='{"task": "index"}')
+            ]),
+            _make_stream_chunk(finish_reason="tool_calls"),
+        ]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://idealab.alibaba-inc.com/api/openai/v1",
+            model="gemini-3.5-flash",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        tool_call = response.choices[0].message.tool_calls[0]
+        assert tool_call.thoughtSignature == "sig-direct-123"
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
     def test_mixed_content_and_tool_calls(self, mock_close, mock_create):
         """Stream with both text and tool calls accumulates both."""
         from run_agent import AIAgent

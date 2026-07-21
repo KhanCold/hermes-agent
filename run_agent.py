@@ -5220,18 +5220,20 @@ class AIAgent:
         the internal message history — this method only modifies the outgoing
         API copy.
 
-        ``extra_content`` (Gemini thought_signature) is also stripped — strict
-        providers reject it with "Extra inputs are not permitted" — UNLESS the
-        outgoing ``model`` is itself Gemini-family, in which case it must be
-        replayed (Gemini 3 thinking models 400 without it). Defaults to
-        stripping when no model is supplied.
+        Gemini thought-signature fields (OpenAI-compat ``extra_content`` and
+        native ``thoughtSignature``) are also stripped — strict providers
+        reject them — UNLESS the outgoing ``model`` is itself Gemini-family,
+        in which case one must be replayed. Defaults to stripping when no
+        model is supplied. Endpoint-specific shape conversion happens later
+        in ``ChatCompletionsTransport.convert_messages``.
 
         Creates new tool_call dicts rather than mutating in-place, so the
         original messages list retains call_id/response_item_id for Codex
         Responses API compatibility (e.g. if the session falls back to a
         Codex provider later).
 
-        Fields stripped: call_id, response_item_id, extra_content (model-gated)
+        Fields stripped: call_id, response_item_id, extra_content and
+        thoughtSignature (both model-gated)
         """
         tool_calls = api_msg.get("tool_calls")
         if not isinstance(tool_calls, list):
@@ -5239,7 +5241,7 @@ class AIAgent:
         from agent.transports.chat_completions import _model_consumes_thought_signature
         _STRIP_KEYS = {"call_id", "response_item_id"}
         if not _model_consumes_thought_signature(model):
-            _STRIP_KEYS = _STRIP_KEYS | {"extra_content"}
+            _STRIP_KEYS = _STRIP_KEYS | {"extra_content", "thoughtSignature"}
         api_msg["tool_calls"] = [
             {k: v for k, v in tc.items() if k not in _STRIP_KEYS}
             if isinstance(tc, dict) else tc

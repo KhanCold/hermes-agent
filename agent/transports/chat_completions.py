@@ -12,6 +12,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 import copy
 from types import SimpleNamespace
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
@@ -21,6 +22,7 @@ from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
 _MISSING = object()
+_IDEALAB_HOST_SUFFIX = "idealab.alibaba-inc.com"
 
 
 def _usage_field(obj: Any, name: str, default: Any = 0) -> Any:
@@ -126,18 +128,49 @@ def _is_gemini_openai_compat_base_url(base_url: Any) -> bool:
 
 def _model_consumes_thought_signature(model: Any) -> bool:
     """True when the outgoing model is a Gemini family model that requires
-    ``extra_content`` (thought_signature) to be replayed on tool calls.
+    a thought signature to be replayed on tool calls.
 
-    Gemini 3 thinking models attach ``extra_content`` to each tool call and
-    reject subsequent requests with HTTP 400 if it is missing. Every other
-    strict OpenAI-compatible provider (Fireworks, Mistral, ...) rejects the
-    request with 400 if ``extra_content`` *is* present. So the field must be
-    kept only when the target model is itself Gemini-family, and stripped
-    otherwise — including when a non-Gemini model inherits stale Gemini
-    ``extra_content`` from earlier in a mixed-provider session.
+    Depending on the endpoint, Gemini thinking models attach either
+    ``extra_content`` or ``thoughtSignature`` to each tool call and reject
+    subsequent requests with HTTP 400 if it is missing. Strict non-Gemini
+    providers reject either field, so signature metadata must be kept only
+    for Gemini-family targets.
     """
     m = str(model or "").lower()
     return "gemini" in m or "gemma" in m
+
+
+def _uses_direct_thought_signature(base_url: Any) -> bool:
+    """Return whether an OpenAI-compatible endpoint expects Gemini's native
+    ``thoughtSignature`` field directly on each tool call.
+
+    Idealab exposes an OpenAI Chat Completions envelope but keeps the native
+    Gemini tool-call metadata shape.  Google's OpenAI-compatible endpoint and
+    aggregators use ``extra_content.google.thought_signature`` instead.
+    """
+    try:
+        host = (urlparse(str(base_url or "")).hostname or "").lower()
+    except Exception:
+        return False
+    return host == _IDEALAB_HOST_SUFFIX or host.endswith(
+        f".{_IDEALAB_HOST_SUFFIX}"
+    )
+
+
+def _signature_from_extra_content(extra_content: Any) -> str | None:
+    """Extract the OpenAI-compat Gemini signature without altering it."""
+    if hasattr(extra_content, "model_dump"):
+        try:
+            extra_content = extra_content.model_dump()
+        except Exception:
+            return None
+    if not isinstance(extra_content, dict):
+        return None
+    google = extra_content.get("google")
+    if not isinstance(google, dict):
+        return None
+    signature = google.get("thought_signature")
+    return signature if isinstance(signature, str) and signature else None
 
 
 class ChatCompletionsTransport(ProviderTransport):
@@ -160,9 +193,12 @@ class ChatCompletionsTransport(ProviderTransport):
         - Codex Responses API fields: ``codex_reasoning_items`` /
           ``codex_message_items`` on the message, ``call_id`` /
           ``response_item_id`` on ``tool_calls`` entries.
-        - ``extra_content`` on ``tool_calls`` (Gemini thought_signature) —
-          stripped unless the outgoing ``model`` is itself Gemini-family.
-          Gemini 3 thinking models attach it for replay, but strict providers
+        - Gemini thought signatures on ``tool_calls`` — represented either as
+          OpenAI-compat ``extra_content.google.thought_signature`` or native
+          Gemini ``thoughtSignature``. They are stripped unless the outgoing
+          ``model`` is itself Gemini-family, and converted to the wire shape
+          expected by the target endpoint. Gemini 3 thinking models attach
+          them for replay, but strict providers
           (Fireworks, Mistral) reject any payload containing it with
           ``Extra inputs are not permitted, field: 'messages[N].tool_calls[M].extra_content'``.
           It must be kept for Gemini targets (replay required) and dropped for
@@ -186,8 +222,9 @@ class ChatCompletionsTransport(ProviderTransport):
           ``Extra inputs are not permitted, field: 'messages[N]._empty_recovery_synthetic'``,
           which then poisons every subsequent request in the session.
         """
-        strip_extra_content = not _model_consumes_thought_signature(
-            kwargs.get("model")
+        consumes_signature = _model_consumes_thought_signature(kwargs.get("model"))
+        direct_signature_wire = consumes_signature and _uses_direct_thought_signature(
+            kwargs.get("base_url")
         )
         needs_sanitize = False
         for msg in messages:
@@ -210,7 +247,19 @@ class ChatCompletionsTransport(ProviderTransport):
                     if isinstance(tc, dict) and (
                         "call_id" in tc
                         or "response_item_id" in tc
-                        or (strip_extra_content and "extra_content" in tc)
+                        or (
+                            not consumes_signature
+                            and (
+                                "extra_content" in tc
+                                or "thoughtSignature" in tc
+                            )
+                        )
+                        or (direct_signature_wire and "extra_content" in tc)
+                        or (
+                            consumes_signature
+                            and not direct_signature_wire
+                            and "thoughtSignature" in tc
+                        )
                     ):
                         needs_sanitize = True
                         break
@@ -239,8 +288,29 @@ class ChatCompletionsTransport(ProviderTransport):
                     if isinstance(tc, dict):
                         tc.pop("call_id", None)
                         tc.pop("response_item_id", None)
-                        if strip_extra_content:
+                        if not consumes_signature:
                             tc.pop("extra_content", None)
+                            tc.pop("thoughtSignature", None)
+                        elif direct_signature_wire:
+                            signature = tc.get("thoughtSignature")
+                            if not isinstance(signature, str) or not signature:
+                                signature = _signature_from_extra_content(
+                                    tc.get("extra_content")
+                                )
+                            tc.pop("extra_content", None)
+                            if signature:
+                                tc["thoughtSignature"] = signature
+                        else:
+                            signature = tc.get("thoughtSignature")
+                            tc.pop("thoughtSignature", None)
+                            if (
+                                "extra_content" not in tc
+                                and isinstance(signature, str)
+                                and signature
+                            ):
+                                tc["extra_content"] = {
+                                    "google": {"thought_signature": signature}
+                                }
         return sanitized
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -301,7 +371,11 @@ class ChatCompletionsTransport(ProviderTransport):
         # Codex sanitization: drop reasoning_items / call_id / response_item_id.
         # Pass model so the Gemini thought_signature (extra_content) is kept for
         # Gemini targets and stripped for strict non-Gemini providers.
-        sanitized = self.convert_messages(messages, model=model)
+        sanitized = self.convert_messages(
+            messages,
+            model=model,
+            base_url=params.get("base_url"),
+        )
 
         # ── Provider profile: single-path when present ──────────────────
         _profile = params.get("provider_profile")
@@ -624,8 +698,8 @@ class ChatCompletionsTransport(ProviderTransport):
         """Normalize OpenAI ChatCompletion to NormalizedResponse.
 
         For chat_completions, this is near-identity — the response is already
-        in OpenAI format.  extra_content on tool_calls (Gemini thought_signature)
-        is preserved via ToolCall.provider_data.  reasoning_details (OpenRouter
+        in OpenAI format. Both Gemini thought-signature wire shapes are
+        preserved via ToolCall.provider_data. reasoning_details (OpenRouter
         unified format) and reasoning_content (DeepSeek/Moonshot) are also
         preserved for downstream replay.
         """
@@ -638,9 +712,9 @@ class ChatCompletionsTransport(ProviderTransport):
             tool_calls = []
             for tc in msg.tool_calls:
                 # Preserve provider-specific extras on the tool call.
-                # Gemini 3 thinking models attach extra_content with
-                # thought_signature — without replay on the next turn the API
-                # rejects the request with 400.
+                # Gemini thinking models attach either OpenAI-compat
+                # extra_content or native thoughtSignature. Without replay on
+                # the next turn the API rejects the request with 400.
                 tc_provider_data: dict[str, Any] = {}
                 extra = getattr(tc, "extra_content", None)
                 if extra is None and hasattr(tc, "model_extra"):
@@ -652,6 +726,12 @@ class ChatCompletionsTransport(ProviderTransport):
                         except Exception:
                             pass
                     tc_provider_data["extra_content"] = extra
+                direct_signature = getattr(tc, "thoughtSignature", None)
+                model_extra = getattr(tc, "model_extra", None)
+                if direct_signature is None and isinstance(model_extra, dict):
+                    direct_signature = model_extra.get("thoughtSignature")
+                if isinstance(direct_signature, str) and direct_signature:
+                    tc_provider_data["thoughtSignature"] = direct_signature
                 tool_calls.append(
                     ToolCall(
                         id=tc.id,

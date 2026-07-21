@@ -28,7 +28,9 @@ class ToolCall:
     protocol-aware code reads:
 
     * Codex: ``{"call_id": "call_XXX", "response_item_id": "fc_XXX"}``
-    * Gemini: ``{"extra_content": {"google": {"thought_signature": "..."}}}``
+    * Gemini OpenAI compatibility:
+      ``{"extra_content": {"google": {"thought_signature": "..."}}}``
+    * Gemini-native compatibility gateways: ``{"thoughtSignature": "..."}``
     * Others: ``None``
     """
 
@@ -74,6 +76,18 @@ class ToolCall:
         uniformly.
         """
         return (self.provider_data or {}).get("extra_content")
+
+    @property
+    def thoughtSignature(self) -> str | None:
+        """Native Gemini thought signature from provider_data.
+
+        Some OpenAI-compatible gateways keep Gemini's native camelCase field
+        directly on the tool call instead of wrapping it in ``extra_content``.
+        The property name intentionally matches that wire field so generic
+        assistant-message builders can preserve it with ``getattr``.
+        """
+        value = (self.provider_data or {}).get("thoughtSignature")
+        return value if isinstance(value, str) and value else None
 
 
 @dataclass

@@ -54,6 +54,14 @@ class TestChatCompletionsBasic:
                              "function": {"name": "t", "arguments": "{}"}}]},
         ]
 
+    def _msg_with_direct_signature(self):
+        return [
+            {"role": "assistant", "content": "ok",
+             "tool_calls": [{"id": "call_1", "type": "function",
+                             "thoughtSignature": "SIG_DIRECT_123",
+                             "function": {"name": "t", "arguments": "{}"}}]},
+        ]
+
     def test_convert_messages_strips_extra_content_for_strict_provider(self, transport):
         """Strict providers (Fireworks, Mistral) reject extra_content on
         tool_calls with HTTP 400. When the outgoing model is NOT Gemini-family,
@@ -72,6 +80,12 @@ class TestChatCompletionsBasic:
         result = transport.convert_messages(msgs)
         assert "extra_content" not in result[0]["tool_calls"][0]
 
+    def test_convert_messages_strips_direct_signature_for_strict_provider(self, transport):
+        msgs = self._msg_with_direct_signature()
+        result = transport.convert_messages(msgs, model="gpt-5.4")
+        assert "thoughtSignature" not in result[0]["tool_calls"][0]
+        assert "thoughtSignature" in msgs[0]["tool_calls"][0]
+
     def test_convert_messages_keeps_extra_content_for_gemini(self, transport):
         """Gemini 3 thinking models require the thought_signature replayed on
         every turn — stripping it would 400. Keep extra_content for Gemini
@@ -83,6 +97,41 @@ class TestChatCompletionsBasic:
             assert result[0]["tool_calls"][0]["extra_content"] == {
                 "google": {"thought_signature": "SIG_123"}
             }, model
+
+    def test_convert_messages_uses_direct_signature_for_idealab(self, transport):
+        msgs = self._msg_with_extra_content()
+        result = transport.convert_messages(
+            msgs,
+            model="gemini-3.5-flash",
+            base_url="https://idealab.alibaba-inc.com/api/openai/v1",
+        )
+        tool_call = result[0]["tool_calls"][0]
+        assert tool_call["thoughtSignature"] == "SIG_123"
+        assert "extra_content" not in tool_call
+        assert "extra_content" in msgs[0]["tool_calls"][0]
+
+    def test_convert_messages_wraps_direct_signature_for_openai_compat(self, transport):
+        msgs = self._msg_with_direct_signature()
+        result = transport.convert_messages(
+            msgs,
+            model="gemini-3.5-flash",
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        )
+        tool_call = result[0]["tool_calls"][0]
+        assert tool_call["extra_content"] == {
+            "google": {"thought_signature": "SIG_DIRECT_123"}
+        }
+        assert "thoughtSignature" not in tool_call
+
+    def test_build_kwargs_passes_base_url_to_signature_conversion(self, transport):
+        kw = transport.build_kwargs(
+            model="gemini-3.5-flash",
+            messages=self._msg_with_direct_signature(),
+            base_url="https://idealab.alibaba-inc.com/api/openai/v1",
+        )
+        tool_call = kw["messages"][0]["tool_calls"][0]
+        assert tool_call["thoughtSignature"] == "SIG_DIRECT_123"
+        assert "extra_content" not in tool_call
 
     def test_convert_messages_strips_tool_name(self, transport):
         """Internal `tool_name` (used for FTS indexing in the SQLite store) is
@@ -798,6 +847,25 @@ class TestChatCompletionsNormalize:
         nr = transport.normalize_response(r)
         assert nr.tool_calls[0].provider_data == {
             "extra_content": {"google": {"thought_signature": "SIG_ABC123"}}
+        }
+
+    def test_tool_call_direct_thought_signature_preserved(self, transport):
+        """Idealab returns native Gemini thoughtSignature in model_extra."""
+        tc = SimpleNamespace(
+            id=None,
+            function=SimpleNamespace(name="terminal", arguments='{"command": "ls"}'),
+            model_extra={"index": 0, "thoughtSignature": "SIG_DIRECT_ABC"},
+        )
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=None, tool_calls=[tc], reasoning_content=None),
+                finish_reason="function_call",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.tool_calls[0].provider_data == {
+            "thoughtSignature": "SIG_DIRECT_ABC"
         }
 
     def test_reasoning_content_preserved_separately(self, transport):

@@ -1307,6 +1307,52 @@ class TestAdversarialEdgeCases:
         assert result.reason == FailoverReason.rate_limit
         assert result.retryable is True
 
+    def test_400_with_mpe_001_code_is_retryable_server_error(self):
+        """Idealab wraps transient model-serving failures in HTTP 400."""
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={
+                "success": False,
+                "message": "模型提供方错误",
+                "code": "MPE-001",
+                "detailMessage": (
+                    '{"code":"InternalError","message":"<500> '
+                    'InternalError.Algo: Batch backend error!"}'
+                ),
+            },
+        )
+
+        result = classify_api_error(e)
+
+        assert result.status_code == 400
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+
+    def test_400_with_mpe_001_context_overflow_still_compresses(self):
+        """Explicit wrapped errors must win over the generic MPE-001 fallback."""
+        e = MockAPIError(
+            "Error code: 400",
+            status_code=400,
+            body={
+                "success": False,
+                "message": "模型提供方错误",
+                "code": "MPE-001",
+                "detailMessage": (
+                    '{"error":{"code":400,"message":"The input token count '
+                    'exceeds the maximum number of tokens allowed 1048576.",'
+                    '"status":"INVALID_ARGUMENT"}}'
+                ),
+            },
+        )
+
+        result = classify_api_error(e)
+
+        assert result.status_code == 400
+        assert result.reason == FailoverReason.context_overflow
+        assert result.retryable is True
+        assert result.should_compress is True
+
     def test_400_with_billing_text(self):
         """Some providers send billing errors as 400."""
         e = MockAPIError(

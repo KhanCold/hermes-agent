@@ -528,6 +528,7 @@ def classify_api_error(
     _raw_msg = str(error).lower()
     _body_msg = ""
     _metadata_msg = ""
+    _detail_msg = ""
     if isinstance(body, dict):
         _err_obj = body.get("error", {})
         if isinstance(_err_obj, dict):
@@ -548,12 +549,24 @@ def classify_api_error(
                         pass
         if not _body_msg:
             _body_msg = str(body.get("message") or "").lower()
+        # Idealab-style gateways keep the upstream provider error in a
+        # top-level detailMessage while exposing only a generic outer message.
+        _detail = body.get("detailMessage")
+        if isinstance(_detail, str):
+            _detail_msg = _detail.lower()
     # Combine all message sources for pattern matching
     parts = [_raw_msg]
     if _body_msg and _body_msg not in _raw_msg:
         parts.append(_body_msg)
     if _metadata_msg and _metadata_msg not in _raw_msg and _metadata_msg not in _body_msg:
         parts.append(_metadata_msg)
+    if (
+        _detail_msg
+        and _detail_msg not in _raw_msg
+        and _detail_msg not in _body_msg
+        and _detail_msg not in _metadata_msg
+    ):
+        parts.append(_detail_msg)
     error_msg = " ".join(parts)
     provider_lower = (provider or "").strip().lower()
     model_lower = (model or "").strip().lower()
@@ -1136,6 +1149,15 @@ def _classify_400(
             retryable=False,
             should_rotate_credential=True,
             should_fallback=True,
+        )
+
+    # MPE-001 is an Idealab gateway wrapper, not the underlying error type.
+    # Let explicit context/rate-limit/billing signals above win; only otherwise
+    # treat the wrapped upstream model-serving failure as a transient 5xx.
+    if error_code_lower == "mpe-001":
+        return result_fn(
+            FailoverReason.server_error,
+            retryable=True,
         )
 
     # Generic 400 + large session → probable context overflow

@@ -120,6 +120,83 @@ hermes doctor       # Diagnose any issues
 
 ---
 
+## MerchantBench integration
+
+This fork includes the Hermes adapter used to run
+[MerchantBench](https://github.com/KhanCold/merchantbench) as a second,
+sibling checkout. Keeping the benchmark and Hermes in separate repositories
+lets MerchantBench own the simulator and public HTTP SDK while this repository
+owns the Hermes runtime integration and its compatible Hermes core changes.
+
+### What the adapter contains
+
+The [`merchantbench_adapter`](merchantbench_adapter/) package has six parts:
+
+| Part | Responsibility |
+| --- | --- |
+| Protocol bridge | Loads MerchantBench's public tool schemas and sends OpenAI-format assistant/tool messages through the unified `/act` endpoint. |
+| Tool routing | Executes `merchantbench_env` calls in MerchantBench while preserving Hermes native tool calls and results in the benchmark trace. |
+| Step lifecycle | Long-polls observations, stops the Hermes inner loop as soon as `end_of_step` is accepted, re-observes after HTTP 425, and exits cleanly on HTTP 410. |
+| Hermes runtime integration | Runs the official `AIAgent` with Hermes native tools, memory, skills, code execution, and context compression. |
+| History integrity | Records tool results, removes transport-only `end_of_step` messages from the next provider request, and preserves valid message-role alternation. |
+| Reliability and accounting | Handles provider retries and model-specific tool-call metadata, and reports foreground, compression, and review token usage to MerchantBench. |
+
+`realshop_adapter` remains as a compatibility alias for older local scripts;
+new integrations should invoke `merchantbench_adapter`.
+
+### Two-repository setup
+
+Place both repositories under the same parent directory:
+
+```text
+workspace/
+├── merchantbench/
+└── hermes-agent/
+```
+
+Create one virtual environment for each repository:
+
+```bash
+git clone https://github.com/KhanCold/merchantbench.git
+git clone https://github.com/KhanCold/hermes-agent.git
+
+python3.11 -m venv merchantbench/.venv
+merchantbench/.venv/bin/python -m pip install -r merchantbench/requirements.txt
+
+python3.11 -m venv hermes-agent/.venv
+hermes-agent/.venv/bin/python -m pip install -e ./hermes-agent
+```
+
+Put the OpenAI-compatible credentials used by Hermes in
+`merchantbench/.env`, then start MerchantBench:
+
+```bash
+cd merchantbench/env
+../.venv/bin/python run.py --port 5050
+```
+
+Open `http://127.0.0.1:5050/new_run`, choose **Hermes**, select a model, and
+start the run. MerchantBench discovers the sibling `hermes-agent` checkout,
+uses `hermes-agent/.venv/bin/python`, creates a run-local `HERMES_HOME`, and
+launches `python -m merchantbench_adapter` automatically.
+
+For non-sibling layouts, set `MERCHANTBENCH_HERMES_AGENT_ROOT` before
+starting MerchantBench. To attach the adapter manually to an existing run:
+
+```bash
+cd hermes-agent
+MERCHANTBENCH_AGENT_SDK_ROOT=../merchantbench/agent \
+  .venv/bin/python -m merchantbench_adapter \
+  --run-id RUN_ID \
+  --base-url http://127.0.0.1:5050 \
+  --model MODEL_NAME
+```
+
+The adapter never contains MerchantBench datasets or simulator state. It only
+uses the public observation, tool-schema, registration, and `/act` interfaces.
+
+---
+
 ## Skip the API-key collection — Nous Portal
 
 Hermes works with whatever provider you want — that's not changing. But if you'd rather not collect five separate API keys for the model, web search, image generation, TTS, and a cloud browser, **[Nous Portal](https://portal.nousresearch.com)** covers all of them under one subscription:

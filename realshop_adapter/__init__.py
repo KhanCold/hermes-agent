@@ -1,8 +1,5 @@
-"""RealShop adapter for Hermes.
+"""Backward-compatible import alias for ``merchantbench_adapter``."""
 
-This package intentionally lives at the edge of the Hermes checkout.  It keeps
-RealShop-specific protocol glue out of Hermes core while still using Hermes'
-model and tool-calling loop.
-"""
+from merchantbench_adapter import __version__
 
-__version__ = "0.1.0"
+__all__ = ["__version__"]

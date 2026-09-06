@@ -581,13 +581,14 @@ def revoke(email: Optional[str] = None) -> None:
             creds.refresh(Request())
 
         import urllib.request
-        urllib.request.urlopen(
+        with urllib.request.urlopen(
             urllib.request.Request(
                 f"https://oauth2.googleapis.com/revoke?token={creds.token}",
                 method="POST",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
-        )
+        ) as response:
+            pass  # response body not needed for revocation
         print("Token revoked with Google.")
     except Exception as exc:
         print(f"Remote revocation failed (token may already be invalid): {exc}")

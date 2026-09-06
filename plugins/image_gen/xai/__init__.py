@@ -69,12 +69,13 @@ def _fetch_live_models() -> Dict[str, Dict[str, Any]]:
     api_key = str(creds.get("api_key") or "").strip()
     if not api_key:
         raise RuntimeError("no xAI credentials")
-    response = requests.get(
+    with requests.get(
         f"{_base_url(creds)}/image-generation-models",
         headers={"Authorization": f"Bearer {api_key}", "User-Agent": hermes_xai_user_agent()},
-        timeout=_LIVE_TIMEOUT)
-    response.raise_for_status()
-    payload = response.json()
+        timeout=_LIVE_TIMEOUT,
+        stream=True) as response:
+        response.raise_for_status()
+        payload = response.json()
     out: Dict[str, Dict[str, Any]] = {}
     for entry in payload.get("models") or payload.get("data") or []:
         model_id = entry.get("id") or entry.get("name") if isinstance(entry, dict) else None

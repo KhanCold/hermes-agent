@@ -222,7 +222,8 @@ def _json_post(url: str, token: str, body: dict, timeout: float):
             "Accept": "application/json",
         },
     )
-    return urllib.request.urlopen(req, timeout=timeout)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
 
 
 def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:

@@ -201,8 +201,8 @@ def _poll_krea_job(
         time.sleep(interval)
         interval = min(interval * _POLL_BACKOFF, _POLL_MAX_INTERVAL)
         try:
-            resp = requests.get(job_url, headers=headers, timeout=30)
-            resp.raise_for_status()
+            with requests.get(job_url, headers=headers, timeout=30, stream=True) as resp:
+                resp.raise_for_status()
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else 0
             if not enhance:

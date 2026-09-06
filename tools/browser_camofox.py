@@ -294,11 +294,19 @@ def _request(method: str, path: str, timeout: Optional[int] = None, **kwargs: An
 
 
 def _post(path: str, body: dict, timeout: Optional[int] = None) -> dict:
-    return _request("post", path, timeout, json=body).json()
+    resp = _request("post", path, timeout, json=body)
+    try:
+        return resp.json()
+    finally:
+        resp.close()
 
 
 def _get(path: str, params: dict = None, timeout: Optional[int] = None) -> dict:
-    return _request("get", path, timeout, params=params).json()
+    resp = _request("get", path, timeout, params=params)
+    try:
+        return resp.json()
+    finally:
+        resp.close()
 
 
 def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None) -> requests.Response:
@@ -307,7 +315,11 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None) -> r
 
 
 def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict:
-    return _request("delete", path, timeout, json=body).json()
+    resp = _request("delete", path, timeout, json=body)
+    try:
+        return resp.json()
+    finally:
+        resp.close()
 
 
 # ---- Tool implementations ----

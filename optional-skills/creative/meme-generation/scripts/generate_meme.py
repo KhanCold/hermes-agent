@@ -43,7 +43,8 @@ def _fetch_url(url: str, timeout: int = 15) -> bytes:
         resp.raise_for_status()
         return resp.content
     import urllib.request
-    return urllib.request.urlopen(url, timeout=timeout).read()
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return resp.read()
 
 
 def load_curated_templates() -> dict:

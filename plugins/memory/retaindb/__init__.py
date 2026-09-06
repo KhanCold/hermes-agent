@@ -307,9 +307,9 @@ class _Client:
         import requests
         token = self.api_key.replace("Bearer ", "").strip()
         url = f"{self.base_url}/v1/files/{quote(file_id, safe='')}/content"
-        resp = requests.get(url, headers={"Authorization": f"Bearer {token}", "x-sdk-runtime": "hermes-plugin"}, timeout=30, allow_redirects=True)
-        resp.raise_for_status()
-        return resp.content
+        with requests.get(url, headers={"Authorization": f"Bearer {token}", "x-sdk-runtime": "hermes-plugin"}, timeout=30, allow_redirects=True, stream=True) as resp:
+            resp.raise_for_status()
+            return resp.content
 
     def ingest_file(self, file_id: str, user_id: str | None = None, agent_id: str | None = None) -> dict:
         body: dict = {}

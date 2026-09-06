@@ -107,7 +107,8 @@ class Browserbase:
             },
             method="POST",
         )
-        urllib.request.urlopen(req, timeout=30)
+        with urllib.request.urlopen(req, timeout=30) as _resp:
+            pass
 
 
 provider = NousCloud() if args.backend == "nous-cloud" else Browserbase()

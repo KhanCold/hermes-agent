@@ -611,21 +611,24 @@ def _http_once(
             url=getattr(e, "url", url),
         )
 
-    final_url = resp.geturl()
-    final_status = resp.status
-    final_headers = dict(resp.headers)
+    try:
+        final_url = resp.geturl()
+        final_status = resp.status
+        final_headers = dict(resp.headers)
 
-    if stream and sink is not None:
-        sink.parent.mkdir(parents=True, exist_ok=True)
-        with sink.open("wb") as f:
-            while True:
-                chunk = resp.read(DOWNLOAD_CHUNK_SIZE)
-                if not chunk:
-                    break
-                f.write(chunk)
-        return HTTPResponse(status=final_status, headers=final_headers, body=b"", url=final_url)
+        if stream and sink is not None:
+            sink.parent.mkdir(parents=True, exist_ok=True)
+            with sink.open("wb") as f:
+                while True:
+                    chunk = resp.read(DOWNLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            return HTTPResponse(status=final_status, headers=final_headers, body=b"", url=final_url)
 
-    return HTTPResponse(status=final_status, headers=final_headers, body=resp.read(), url=final_url)
+        return HTTPResponse(status=final_status, headers=final_headers, body=resp.read(), url=final_url)
+    finally:
+        resp.close()
 
 
 def http_get(url: str, **kwargs: Any) -> HTTPResponse:

@@ -45,8 +45,9 @@ def _masked(secret: str) -> str:
     return f"...{secret[-4:]}" if len(secret) > 4 else "set"
 
 
-def _http_get(url: str, path: str, timeout: int):
-    return urllib.request.urlopen(urllib.request.Request(f"{url.rstrip('/')}{path}", method="GET"), timeout=timeout)
+def _http_get(url: str, path: str, timeout: int) -> bytes:
+    with urllib.request.urlopen(urllib.request.Request(f"{url.rstrip('/')}{path}", method="GET"), timeout=timeout) as resp:
+        return resp.read()
 
 
 def _prompt_api_key(label: str, env_var: str, hermes_home: str) -> str:
@@ -336,7 +337,7 @@ def _ensure_ollama(models: list[str]) -> bool:
         return False
     for model in models:
         try:
-            names = [m.get("name", "") for m in json.loads(_http_get(_OLLAMA_URL, "/api/tags", 5).read()).get("models", [])]
+            names = [m.get("name", "") for m in json.loads(_http_get(_OLLAMA_URL, "/api/tags", 5)).get("models", [])]
         except Exception:
             names = []
         if any(model in n or model.split(":")[0] in n for n in names):

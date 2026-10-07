@@ -402,8 +402,7 @@ def revoke():
             method="POST",
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            resp.read()
+        urllib.request.urlopen(req, timeout=15).close()
         print("Token revoked with Google.")
     except Exception as e:
         print(f"Remote revocation failed (token may already be invalid): {e}")

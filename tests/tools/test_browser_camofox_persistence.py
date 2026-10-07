@@ -265,6 +265,7 @@ class TestVncUrlDiscovery:
         with patch("tools.browser_camofox.requests.get", return_value=health_resp):
             assert check_camofox_available() is True
         assert get_vnc_url() == "http://myhost:6080"
+        health_resp.__exit__.assert_called_once()
 
 
     def test_navigate_includes_vnc_hint(self, tmp_path, monkeypatch):

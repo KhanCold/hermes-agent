@@ -74,7 +74,15 @@ def _post(url, data=None, headers=None, form=False, timeout=30):
 
 def _get_json(url, timeout=20):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    r = urllib.request.urlopen(req, timeout=timeout)
+    try:
+        r = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        # urlopen raises before any response is bound to `r`; the error
+        # response has no other owner, so close it here as _post does.
+        try:
+            raise
+        finally:
+            _close(e)
     try:
         return json.loads(r.read())
     finally:

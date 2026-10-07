@@ -1,106 +1,75 @@
-"""Regression tests for diagnose-oauth-mcp.py response cleanup.
-
-Complements tests/skills/test_mcp_oauth_remote_gateway_skill.py: pins the
-close-on-every-response behavior of _post/_get_json (including the HTTPError
-branch) so a later edit cannot silently drop the cleanup. The existing
-FakeResponse deliberately models no close(); these tests use their own fake.
-"""
-from __future__ import annotations
+"""OAuth diagnostics close success and HTTP error responses on every read path."""
 
 import importlib.util
-import sys
+import io
 import urllib.error
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock
 
-SKILL_DIR = (
-    Path(__file__).resolve().parents[2]
-    / "optional-skills"
-    / "mcp"
-    / "mcp-oauth-remote-gateway"
-)
-SCRIPT_PATH = SKILL_DIR / "scripts" / "diagnose-oauth-mcp.py"
+import pytest
 
 
-def load_module():
-    spec = importlib.util.spec_from_file_location("diagnose_oauth_mcp_close_test", SCRIPT_PATH)
+@pytest.fixture
+def diagnose():
+    path = Path(__file__).resolve().parents[2] / "optional-skills/mcp/mcp-oauth-remote-gateway/scripts/diagnose-oauth-mcp.py"
+    spec = importlib.util.spec_from_file_location("diagnose_response_test", path)
     module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return sys.modules[spec.name]
+    return module
 
 
-class TrackedResponse:
-    """Models a real urllib response: read() + close(), with close counted."""
+@pytest.mark.parametrize("helper", ["_post", "_get_json"])
+@pytest.mark.parametrize("read_error", [False, True])
+def test_success_response_closed(diagnose, monkeypatch, helper, read_error):
+    response = io.BytesIO(b'{"ok": true}')
+    response.status = 200
+    response.headers = {"Content-Type": "application/json"}
+    if read_error:
+        response.read = Mock(side_effect=OSError("read interrupted"))
+    monkeypatch.setattr(diagnose.urllib.request, "urlopen", Mock(return_value=response))
 
-    def __init__(self, body=b"{}", status=200):
-        self.status = status
-        self.headers = {}
-        self._body = body
-        self.close_count = 0
-
-    def read(self):
-        return self._body
-
-    def close(self):
-        self.close_count += 1
-
-
-def _err(req=None, code=400):
-    url = req.full_url if req is not None else "http://x/"
-    e = urllib.error.HTTPError(url, code, "err", {}, None)
-    e.close_count = 0
-    # Count only; do not call the real close (fp is None here).
-    e.close = lambda: setattr(e, "close_count", e.close_count + 1)
-    return e
+    if read_error:
+        with pytest.raises(OSError, match="read interrupted"):
+            getattr(diagnose, helper)("https://oauth.example/test")
+    elif helper == "_post":
+        assert diagnose._post("https://oauth.example/test") == (
+            200, response.headers, b'{"ok": true}')
+    else:
+        assert diagnose._get_json("https://oauth.example/test") == {"ok": True}
+    assert response.closed
 
 
-def test_post_success_closes_response():
-    mod = load_module()
-    resp = TrackedResponse(b'{"a": 1}')
-    with patch.object(mod.urllib.request, "urlopen", return_value=resp):
-        status, _hdrs, body = mod._post("http://x/", data={"k": 1})
-    assert (status, body) == (200, b'{"a": 1}')
-    assert resp.close_count == 1
+@pytest.mark.parametrize("helper", ["_post", "_get_json"])
+def test_http_error_response_closed(diagnose, monkeypatch, helper):
+    body = io.BytesIO(b'{"error": "invalid_token"}')
+    error = urllib.error.HTTPError("https://oauth.example/test", 401, "invalid", {}, body)
+    monkeypatch.setattr(diagnose.urllib.request, "urlopen", Mock(side_effect=error))
+
+    if helper == "_post":
+        assert diagnose._post("https://oauth.example/test") == (
+            401, {}, b'{"error": "invalid_token"}')
+    else:
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            diagnose._get_json("https://oauth.example/test")
+        assert raised.value is error
+    assert body.closed
 
 
-def test_post_http_error_closes_error_response():
-    mod = load_module()
-    def boom(req, timeout=None):
-        raise _err(req)
-    with patch.object(mod.urllib.request, "urlopen", side_effect=boom):
-        code, _hdrs, _body = mod._post("http://x/", data={"k": 1})
-    assert code == 400
+def test_invalid_json_closes_response(diagnose, monkeypatch):
+    response = io.BytesIO(b"invalid json")
+    monkeypatch.setattr(diagnose.urllib.request, "urlopen", Mock(return_value=response))
+
+    with pytest.raises(ValueError):
+        diagnose._get_json("https://oauth.example/test")
+    assert response.closed
 
 
-def test_get_json_success_closes_response():
-    mod = load_module()
-    resp = TrackedResponse(b'{"ok": true}')
-    with patch.object(mod.urllib.request, "urlopen", return_value=resp):
-        out = mod._get_json("http://x/meta")
-    assert out == {"ok": True}
-    assert resp.close_count == 1
+def test_post_error_body_read_failure_still_closes(diagnose, monkeypatch):
+    body = io.BytesIO(b"unused")
+    body.read = Mock(side_effect=OSError("read interrupted"))
+    error = urllib.error.HTTPError("https://oauth.example/test", 401, "invalid", {}, body)
+    monkeypatch.setattr(diagnose.urllib.request, "urlopen", Mock(side_effect=error))
 
-
-def test_get_json_http_error_closes_error_response_and_propagates():
-    mod = load_module()
-    err = _err(None, code=503)
-    def boom(req, timeout=None):
-        raise err
-    with patch.object(mod.urllib.request, "urlopen", side_effect=boom):
-        try:
-            mod._get_json("http://x/meta")
-            raise SystemExit("expected HTTPError")
-        except urllib.error.HTTPError as e:
-            assert e is err
-    assert err.close_count == 1
-
-
-def test_close_is_best_effort_for_fakes_without_close():
-    mod = load_module()
-    class NoClose:
-        def read(self):
-            return b"{}"
-    with patch.object(mod.urllib.request, "urlopen", return_value=NoClose()):
-        assert mod._get_json("http://x/meta") == {}
+    with pytest.raises(OSError, match="read interrupted"):
+        diagnose._post("https://oauth.example/test")
+    assert body.closed

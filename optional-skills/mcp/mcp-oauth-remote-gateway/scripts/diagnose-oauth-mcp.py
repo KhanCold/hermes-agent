@@ -43,13 +43,6 @@ def _tokens_dir():
     return os.path.join(_hermes_home(), "mcp-tokens")
 
 
-def _close(resp):
-    """Best-effort close; test fakes may not model close()."""
-    close = getattr(resp, "close", None)
-    if callable(close):
-        close()
-
-
 def _post(url, data=None, headers=None, form=False, timeout=30):
     if form:
         body = urllib.parse.urlencode(data).encode()
@@ -64,12 +57,12 @@ def _post(url, data=None, headers=None, form=False, timeout=30):
         try:
             return r.status, dict(r.headers), r.read()
         finally:
-            _close(r)
+            r.close()
     except urllib.error.HTTPError as e:
         try:
             return e.code, dict(e.headers), e.read()
         finally:
-            _close(e)
+            e.close()
 
 
 def _get_json(url, timeout=20):
@@ -79,14 +72,12 @@ def _get_json(url, timeout=20):
     except urllib.error.HTTPError as e:
         # urlopen raises before any response is bound to `r`; the error
         # response has no other owner, so close it here as _post does.
-        try:
-            raise
-        finally:
-            _close(e)
+        e.close()
+        raise
     try:
         return json.loads(r.read())
     finally:
-        _close(r)
+        r.close()
 
 
 def _mcp_initialize(mcp_url, access_token):

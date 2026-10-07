@@ -390,6 +390,7 @@ def revoke():
     _ensure_deps()
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
+    import urllib.error
 
     try:
         creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
@@ -405,6 +406,8 @@ def revoke():
         urllib.request.urlopen(req, timeout=15).close()
         print("Token revoked with Google.")
     except Exception as e:
+        if isinstance(e, urllib.error.HTTPError):
+            e.close()
         print(f"Remote revocation failed (token may already be invalid): {e}")
 
     TOKEN_PATH.unlink(missing_ok=True)

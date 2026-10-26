@@ -1,4 +1,4 @@
-"""Response lifetime regression tests."""
+"""Response lifetime regression tests for browser CDP endpoint discovery."""
 
 import io
 from unittest.mock import Mock
@@ -14,7 +14,7 @@ import requests
     (200, b"invalid json", "http://localhost:9222"),
 ])
 def test_discovery_closes_response(monkeypatch, status, body, expected):
-    from tools.browser_tool_cdp import _resolve_cdp_override
+    from tools.browser_session_cdp import resolve_cdp_override
 
     response = requests.Response()
     response.status_code = status
@@ -23,5 +23,5 @@ def test_discovery_closes_response(monkeypatch, status, body, expected):
     response.close = Mock(wraps=response.close)
     monkeypatch.setattr(requests, "get", lambda *args, **kwargs: response)
 
-    assert _resolve_cdp_override("http://localhost:9222") == expected
+    assert resolve_cdp_override("http://localhost:9222") == expected
     response.close.assert_called_once_with()
